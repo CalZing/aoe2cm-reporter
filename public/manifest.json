@@ -1,7 +1,7 @@
 {
     "name": "AoE2 CM Reporter",
     "short_name": "CM Reporter",
-    "description": "Physical draft reporter for aoe2cm.net",
+    "description": "Report physical AoE2 drafts to aoe2cm.net",
     "start_url": "/",
     "display": "standalone",
     "orientation": "any",

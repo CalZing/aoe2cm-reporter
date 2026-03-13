@@ -1,8 +1,10 @@
 // AoE2 CM Reporter – Dual mode: Live + Post-draft
+// Reports a physical Captains Mode draft to aoe2cm.net.
+
 (function () {
     'use strict';
 
-    // --- Civ decoder (mirrors aoe2cm2 CivilisationEncoder) ---
+    // --- Civilisation decoder (mirrors aoe2cm2 CivilisationEncoder) ---
     const ALL_CIVS = [
         'Aztecs','Berbers','Britons','Burmese','Byzantines','Celts','Chinese',
         'Ethiopians','Franks','Goths','Huns','Incas','Indians','Italians',
@@ -53,13 +55,28 @@
         return [];
     }
 
+    // --- Extract preset ID from URL or raw input ---
+    function extractPresetId(input) {
+        input = input.trim();
+        // Handle full URLs like https://aoe2cm.net/preset/WBp4y or aoe2cm.net/preset/WBp4y
+        const urlMatch = input.match(/aoe2cm\.net\/preset\/([A-Za-z0-9_-]+)/);
+        if (urlMatch) return urlMatch[1];
+        // Handle any URL with /preset/ path
+        const pathMatch = input.match(/\/preset\/([A-Za-z0-9_-]+)/);
+        if (pathMatch) return pathMatch[1];
+        // Otherwise treat as raw ID (strip whitespace)
+        return input;
+    }
+
     // --- State ---
     let socket = null;
-    let mode = 'post'; // 'post' or 'live'
+    let mode = 'post';
     let draft = null;
     let selectedOptionId = null;
-    let liveConnected = false;  // live mode: server sockets connected?
-    let livePending = false;    // live mode: waiting for server ack?
+    let liveConnected = false;
+    let livePending = false;
+    let presetLookupTimer = null;
+    let lastLookedUpId = '';
 
     // --- DOM ---
     const $ = s => document.querySelector(s);
@@ -68,6 +85,7 @@
     const draftScreen = $('#draft-screen');
     const uploadScreen = $('#upload-screen');
     const presetInput = $('#preset-id');
+    const presetPreview = $('#preset-preview');
     const hostInput = $('#host-name');
     const guestInput = $('#guest-name');
     const createBtn = $('#create-btn');
@@ -90,7 +108,10 @@
     const specUrlEl = $('#spec-url');
     const newDraftBtn = $('#new-draft-btn');
 
-    // --- Init ---
+    // ============================================================
+    // INIT
+    // ============================================================
+
     function init() {
         socket = io({ transports: ['websocket', 'polling'] });
 
@@ -102,25 +123,29 @@
             console.error('Socket connection error:', err.message);
             showError(setupError, 'Cannot connect to server: ' + err.message);
         });
-        socket.on('disconnect', (reason) => {
-            console.log('Socket disconnected:', reason);
-        });
 
-        // Setup
+        // Setup controls
         createBtn.addEventListener('click', startDraft);
         $$('.mode-btn').forEach(btn => {
             btn.addEventListener('click', () => {
                 $$('.mode-btn').forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
                 mode = btn.dataset.mode;
-                localStorage.setItem('aoe2cm_mode', mode);
+                try { localStorage.setItem('aoe2cm_mode', mode); } catch (e) {}
             });
         });
         [presetInput, hostInput, guestInput].forEach(el => {
             el.addEventListener('keydown', e => { if (e.key === 'Enter') startDraft(); });
         });
 
-        // Draft
+        // Preset auto-lookup on input
+        presetInput.addEventListener('input', onPresetInput);
+        presetInput.addEventListener('paste', () => {
+            // Trigger lookup after paste event completes
+            setTimeout(onPresetInput, 50);
+        });
+
+        // Draft controls
         uploadBtn.addEventListener('click', uploadDraft);
         undoBtn.addEventListener('click', undoLastAction);
         specLinkBtn.addEventListener('click', copySpecLink);
@@ -137,42 +162,92 @@
         socket.on('upload_error', onUploadError);
 
         // Restore saved values
-        presetInput.value = localStorage.getItem('aoe2cm_preset') || '';
-        hostInput.value = localStorage.getItem('aoe2cm_host') || '';
-        guestInput.value = localStorage.getItem('aoe2cm_guest') || '';
-        const savedMode = localStorage.getItem('aoe2cm_mode');
-        if (savedMode === 'live' || savedMode === 'post') {
-            mode = savedMode;
-            $$('.mode-btn').forEach(b => {
-                b.classList.toggle('active', b.dataset.mode === mode);
-            });
+        try {
+            hostInput.value = localStorage.getItem('aoe2cm_host') || '';
+            guestInput.value = localStorage.getItem('aoe2cm_guest') || '';
+            const savedMode = localStorage.getItem('aoe2cm_mode');
+            if (savedMode === 'live' || savedMode === 'post') {
+                mode = savedMode;
+                $$('.mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+            }
+        } catch (e) {}
+
+        // Check for preset in query string: ?preset=WBp4y
+        const params = new URLSearchParams(window.location.search);
+        const qsPreset = params.get('preset');
+        if (qsPreset) {
+            presetInput.value = extractPresetId(qsPreset);
+            onPresetInput(); // trigger lookup immediately
         }
     }
 
     // ============================================================
-    // SETUP
+    // PRESET INPUT HANDLING
     // ============================================================
 
-    function startDraft() {
-        const presetId = presetInput.value.trim();
-        const hostName = hostInput.value.trim() || 'Host';
-        const guestName = guestInput.value.trim() || 'Guest';
-        if (!presetId) { showError(setupError, 'Enter a preset ID'); return; }
+    function onPresetInput() {
+        const raw = presetInput.value;
+        const id = extractPresetId(raw);
 
-        if (!socket.connected) {
-            showError(setupError, 'Not connected to server — waiting for connection…');
+        // If user pasted a URL, replace the input with just the ID
+        if (raw !== id && raw.includes('/')) {
+            presetInput.value = id;
+        }
+
+        // Clear preview if empty or too short
+        if (!id || id.length < 3) {
+            presetPreview.classList.add('hidden');
+            presetPreview.textContent = '';
+            lastLookedUpId = '';
             return;
         }
 
-        console.log('startDraft:', { presetId, hostName, guestName, mode });
+        // Don't re-fetch the same ID
+        if (id === lastLookedUpId) return;
 
-        localStorage.setItem('aoe2cm_preset', presetId);
-        localStorage.setItem('aoe2cm_host', hostName);
-        localStorage.setItem('aoe2cm_guest', guestName);
+        // Debounce: wait 400ms after last keystroke
+        clearTimeout(presetLookupTimer);
+        presetLookupTimer = setTimeout(() => lookupPreset(id), 400);
+    }
+
+    function lookupPreset(presetId) {
+        if (!socket.connected) return;
+        lastLookedUpId = presetId;
+        presetPreview.textContent = 'Looking up…';
+        presetPreview.classList.remove('hidden');
+        presetPreview.className = 'preset-preview loading';
+
+        socket.emit('fetch_preset', { presetId }, (response) => {
+            if (response.error) {
+                presetPreview.textContent = `Not found: ${presetId}`;
+                presetPreview.className = 'preset-preview error';
+            } else {
+                presetPreview.textContent = `✓ ${response.name} (${response.turnCount} turns)`;
+                presetPreview.className = 'preset-preview found';
+            }
+        });
+    }
+
+    // ============================================================
+    // SETUP: CREATE DRAFT
+    // ============================================================
+
+    function startDraft() {
+        const presetId = extractPresetId(presetInput.value);
+        const hostName = hostInput.value.trim() || 'Host';
+        const guestName = guestInput.value.trim() || 'Guest';
+        if (!presetId) { showError(setupError, 'Enter a preset ID or URL'); return; }
+        if (!socket.connected) { showError(setupError, 'Not connected to server'); return; }
+
+        try {
+            localStorage.setItem('aoe2cm_host', hostName);
+            localStorage.setItem('aoe2cm_guest', guestName);
+        } catch (e) {}
 
         createBtn.disabled = true;
         createBtn.textContent = 'Creating draft…';
         hideError(setupError);
+        console.log('startDraft:', { presetId, hostName, guestName, mode });
 
         socket.emit('create_draft', { presetId, hostName, guestName }, (response) => {
             if (response.error) {
@@ -216,7 +291,7 @@
     }
 
     // ============================================================
-    // POST-DRAFT MODE (local draft, upload at end)
+    // POST-DRAFT MODE
     // ============================================================
 
     function initPostMode() {
@@ -224,7 +299,6 @@
         renderAll();
         setupScreen.classList.remove('active');
         draftScreen.classList.add('active');
-        // Undo visible in post mode
         undoBtn.classList.remove('always-hidden');
     }
 
@@ -238,14 +312,14 @@
                     chosenOptionId: null, turnIndex: draft.nextAction,
                 });
                 draft.nextAction++;
-            } else { break; }
+            } else break;
         }
     }
 
     function applyLocalAction(optionId) {
         const turn = getCurrentTurn();
         if (!turn || turn.executingPlayer === 'NONE') return;
-        const actionMap = { PICK:'pick', BAN:'ban', SNIPE:'snipe', STEAL:'steal' };
+        const actionMap = { PICK: 'pick', BAN: 'ban', SNIPE: 'snipe', STEAL: 'steal' };
         draft.events.push({
             player: turn.player, executingPlayer: turn.executingPlayer,
             actionType: actionMap[turn.action] || turn.action.toLowerCase(),
@@ -275,16 +349,15 @@
     }
 
     // ============================================================
-    // LIVE MODE (real-time via server sockets)
+    // LIVE MODE
     // ============================================================
 
     function initLiveMode() {
-        // Show draft screen with "connecting" state
         turnBadge.textContent = 'Connecting…';
         turnBadge.className = 'turn-badge waiting';
         renderOptionsGrid();
         renderEvents();
-        undoBtn.classList.add('always-hidden'); // no undo in live mode
+        undoBtn.classList.add('always-hidden');
         uploadBtn.classList.add('hidden');
         setupScreen.classList.remove('active');
         draftScreen.classList.add('active');
@@ -295,11 +368,10 @@
             guestName: draft.guestName,
         }, (response) => {
             if (response.error) {
-                showDraftError(`Connection failed: ${response.error}`);
+                showDraftError('Connection failed: ' + response.error);
                 return;
             }
             liveConnected = true;
-            // Skip leading admin turns in our local tracking
             skipAdminTurns();
             renderAll();
         });
@@ -307,11 +379,8 @@
 
     function onLivePlayerEvent(event) {
         if (!draft) return;
-        // The server confirmed this event happened. Update local state.
-        const HIDDEN_IDS = ['HIDDEN_PICK','HIDDEN_BAN','HIDDEN_SNIPE','HIDDEN_STEAL','HIDDEN'];
+        const HIDDEN_IDS = ['HIDDEN_PICK', 'HIDDEN_BAN', 'HIDDEN_SNIPE', 'HIDDEN_STEAL', 'HIDDEN'];
         let resolvedId = event.chosenOptionId;
-        // If the event came back as hidden (opponent's hidden turn from HOST perspective),
-        // but WE sent it, we know what it was from our pending act
         if (HIDDEN_IDS.includes(resolvedId) && livePending && draft._pendingOptionId) {
             resolvedId = draft._pendingOptionId;
         }
@@ -351,10 +420,9 @@
         if (!liveConnected || livePending) return;
         const turn = getCurrentTurn();
         if (!turn || turn.executingPlayer === 'NONE') return;
-        const actionMap = { PICK:'pick', BAN:'ban', SNIPE:'snipe', STEAL:'steal' };
+        const actionMap = { PICK: 'pick', BAN: 'ban', SNIPE: 'snipe', STEAL: 'steal' };
         livePending = true;
         draft._pendingOptionId = optionId;
-
         turnBadge.textContent = 'Sending…';
         turnBadge.className = 'turn-badge waiting';
 
@@ -370,12 +438,11 @@
                 showDraftError(response.error);
                 renderTurnIndicator();
             }
-            // Success: wait for live_player_event from server
         });
     }
 
     // ============================================================
-    // UPLOAD (post-draft mode)
+    // UPLOAD (post-draft)
     // ============================================================
 
     function uploadDraft() {
@@ -396,7 +463,7 @@
             events: eventsForUpload,
         }, (response) => {
             if (response?.error) {
-                uploadStatus.textContent = `Error: ${response.error}`;
+                uploadStatus.textContent = 'Error: ' + response.error;
                 uploadProgress.style.width = '0%';
                 uploadBtn.disabled = false;
                 draftScreen.classList.add('active');
@@ -411,7 +478,7 @@
             uploadProgress.style.width = '30%';
         } else if (data.phase === 'replaying') {
             const pct = 30 + (data.current / data.total) * 65;
-            uploadProgress.style.width = `${pct}%`;
+            uploadProgress.style.width = pct + '%';
             uploadStatus.textContent = `Replaying ${data.current}/${data.total}…`;
         }
     }
@@ -421,7 +488,7 @@
         uploadResult.classList.remove('hidden');
     }
     function onUploadError(data) {
-        uploadStatus.textContent = `Error: ${data.message}`;
+        uploadStatus.textContent = 'Error: ' + data.message;
     }
 
     // ============================================================
@@ -437,7 +504,7 @@
         return draft && draft.nextAction >= draft.turns.length;
     }
 
-    // --- Availability ---
+    // --- Availability tracking ---
     function computeAvailableOptions() {
         const allIds = draft.options.map(o => o.id);
         const h = { pick: new Set(allIds), ban: new Set(allIds), snipe: new Set(), steal: new Set() };
@@ -477,7 +544,7 @@
         if (!turn || turn.executingPlayer === 'NONE') return new Set();
         const valid = computeAvailableOptions();
         const pv = turn.player === 'HOST' ? valid.host : valid.guest;
-        const am = { PICK:'pick', BAN:'ban', SNIPE:'snipe', STEAL:'steal' };
+        const am = { PICK: 'pick', BAN: 'ban', SNIPE: 'snipe', STEAL: 'steal' };
         const pool = pv[am[turn.action]];
         if (!pool) return new Set();
         const cats = turn.categories || ['default'];
@@ -496,10 +563,10 @@
             const isH = evt.player === 'HOST';
             const p = isH ? 'H' : 'G';
             switch (evt.actionType) {
-                case 'pick': r.cssClass = isH?'picked-host':'picked-guest'; r.badge=`${p} Pick`; r.badgeClass=isH?'badge-host':'badge-guest'; r.available=false; break;
-                case 'ban': r.cssClass='banned'; r.badge=`${p} Ban`; r.badgeClass='badge-ban'; r.available=false; break;
-                case 'snipe': r.cssClass='sniped'; r.badge=`${p} Snipe`; r.badgeClass='badge-snipe'; r.available=false; break;
-                case 'steal': r.cssClass=isH?'picked-host':'picked-guest'; r.badge=`${p} Steal`; r.badgeClass=isH?'badge-host':'badge-guest'; r.available=false; break;
+                case 'pick': r.cssClass = isH ? 'picked-host' : 'picked-guest'; r.badge = p + ' Pick'; r.badgeClass = isH ? 'badge-host' : 'badge-guest'; r.available = false; break;
+                case 'ban': r.cssClass = 'banned'; r.badge = p + ' Ban'; r.badgeClass = 'badge-ban'; r.available = false; break;
+                case 'snipe': r.cssClass = 'sniped'; r.badge = p + ' Snipe'; r.badgeClass = 'badge-snipe'; r.available = false; break;
+                case 'steal': r.cssClass = isH ? 'picked-host' : 'picked-guest'; r.badge = p + ' Steal'; r.badgeClass = isH ? 'badge-host' : 'badge-guest'; r.available = false; break;
             }
         }
         return r;
@@ -509,16 +576,11 @@
     // RENDERING
     // ============================================================
 
-    function renderAll() {
-        renderTurnIndicator();
-        renderOptionsGrid();
-        renderEvents();
-        renderButtons();
-    }
+    function renderAll() { renderTurnIndicator(); renderOptionsGrid(); renderEvents(); renderButtons(); }
 
     function renderTurnIndicator() {
         if (isDraftComplete()) {
-            turnBadge.textContent = mode === 'live' ? 'Draft Complete' : 'Draft Complete — Ready to upload';
+            turnBadge.textContent = mode === 'live' ? 'Draft Complete' : 'Draft Complete';
             turnBadge.className = 'turn-badge complete';
             turnPlayer.textContent = '';
             turnAction.textContent = mode === 'live' ? 'All turns done!' : 'All turns done — press Upload below';
@@ -529,21 +591,18 @@
         const turn = getCurrentTurn();
         if (!turn) return;
         if (mode === 'live' && !liveConnected) {
-            turnBadge.textContent = 'Connecting…';
-            turnBadge.className = 'turn-badge waiting';
+            turnBadge.textContent = 'Connecting…'; turnBadge.className = 'turn-badge waiting';
             turnPlayer.textContent = ''; turnAction.textContent = ''; turnDetail.textContent = '';
             return;
         }
-
         const isH = turn.player === 'HOST';
         const name = isH ? draft.hostName : draft.guestName;
-        turnBadge.textContent = `${name} — ${fmtAction(turn.action)}`;
-        turnBadge.className = `turn-badge ${isH ? 'host-turn' : 'guest-turn'}`;
+        turnBadge.textContent = name + ' — ' + fmtAction(turn.action);
+        turnBadge.className = 'turn-badge ' + (isH ? 'host-turn' : 'guest-turn');
         turnPlayer.textContent = name;
-        turnPlayer.className = `turn-player ${isH ? 'host-color' : 'guest-color'}`;
+        turnPlayer.className = 'turn-player ' + (isH ? 'host-color' : 'guest-color');
         turnAction.textContent = fmtAction(turn.action);
-        turnAction.className = `turn-action action-${turn.action.toLowerCase()}`;
-
+        turnAction.className = 'turn-action action-' + turn.action.toLowerCase();
         const details = [];
         if (turn.hidden) details.push('Hidden');
         if (turn.parallel) details.push('Parallel');
@@ -553,7 +612,7 @@
         for (let i = draft.nextAction; i < draft.turns.length; i++) {
             if (draft.turns[i].executingPlayer !== 'NONE') remaining++;
         }
-        turnDetail.textContent = (details.length ? `(${details.join(', ')}) — ` : '') + `${remaining} turns left`;
+        turnDetail.textContent = (details.length ? '(' + details.join(', ') + ') — ' : '') + remaining + ' turns left';
     }
 
     function renderOptionsGrid() {
@@ -566,49 +625,45 @@
             if (!cats.has(c)) cats.set(c, []);
             cats.get(c).push(opt);
         }
-
         for (const [cat, opts] of cats) {
             if (cats.size > 1) {
                 const h = document.createElement('div');
                 h.className = 'category-header';
-                h.textContent = cat === 'default' ? 'Civilisations' : cap(cat);
+                h.textContent = cat === 'default' ? 'Civilisations' : cat.charAt(0).toUpperCase() + cat.slice(1);
                 optionsGrid.appendChild(h);
             }
             const grid = document.createElement('div');
             grid.className = 'options-subgrid';
             optionsGrid.appendChild(grid);
-
             for (const opt of opts) {
                 const ds = getOptionDisplayState(opt.id);
                 const isValid = validIds.has(opt.id);
                 const el = document.createElement('div');
-                el.className = `option-card ${ds.cssClass}`;
+                el.className = 'option-card ' + ds.cssClass;
                 if (!isValid && !isDraftComplete()) el.classList.add('unavailable');
                 if (selectedOptionId === opt.id) el.classList.add('selected');
 
                 const img = document.createElement('img');
                 img.src = opt.imageUrls?.emblem || opt.imageUrls?.unit || '';
                 img.alt = opt.name || opt.id; img.loading = 'lazy';
-                img.onerror = function() {
+                img.onerror = function () {
                     if (this.src.includes('emblem')) this.src = opt.imageUrls?.unit || '';
                     else this.style.display = 'none';
                 };
                 el.appendChild(img);
-
                 const nameEl = document.createElement('span');
                 nameEl.className = 'option-name';
                 nameEl.textContent = opt.name || opt.id;
                 el.appendChild(nameEl);
-
                 if (ds.badge) {
                     const badge = document.createElement('span');
-                    badge.className = `option-badge ${ds.badgeClass}`;
+                    badge.className = 'option-badge ' + ds.badgeClass;
                     badge.textContent = ds.badge;
                     el.appendChild(badge);
                 }
-
-                const canClick = isValid && !isDraftComplete() && !(mode === 'live' && livePending);
-                if (canClick) el.addEventListener('click', () => onOptionClick(opt.id));
+                if (isValid && !isDraftComplete() && !(mode === 'live' && livePending)) {
+                    el.addEventListener('click', () => onOptionClick(opt.id));
+                }
                 grid.appendChild(el);
             }
         }
@@ -623,14 +678,14 @@
             el.className = 'event-item';
             if (evt.actionType === 'admin') {
                 el.classList.add('event-admin');
-                el.innerHTML = `<span class="event-num">${i+1}</span><span class="event-text">⚙️ ${fmtAction(evt.action)}</span>`;
+                el.innerHTML = '<span class="event-num">' + (i + 1) + '</span><span class="event-text">⚙️ ' + fmtAction(evt.action) + '</span>';
             } else {
                 const isH = evt.player === 'HOST';
                 el.classList.add(isH ? 'event-host' : 'event-guest');
-                el.innerHTML = `<span class="event-num">${i+1}</span>
-                    <span class="event-player ${isH?'host-color':'guest-color'}">${isH?draft.hostName:draft.guestName}</span>
-                    <span class="event-action-type">${evt.actionType}</span>
-                    <span class="event-option">${evt.chosenOptionId}</span>`;
+                el.innerHTML = '<span class="event-num">' + (i + 1) + '</span>'
+                    + '<span class="event-player ' + (isH ? 'host-color' : 'guest-color') + '">' + (isH ? draft.hostName : draft.guestName) + '</span>'
+                    + '<span class="event-action-type">' + evt.actionType + '</span>'
+                    + '<span class="event-option">' + evt.chosenOptionId + '</span>';
             }
             eventsList.appendChild(el);
         }
@@ -645,7 +700,6 @@
     }
 
     function showDraftComplete() {
-        // For live mode, the draft is done — just show a message
         turnBadge.textContent = 'Draft Complete';
         turnBadge.className = 'turn-badge complete';
     }
@@ -656,14 +710,9 @@
 
     function onOptionClick(optionId) {
         if (selectedOptionId === optionId) {
-            // Second tap: confirm
             selectedOptionId = null;
-            if (mode === 'live') {
-                sendLiveAct(optionId);
-            } else {
-                applyLocalAction(optionId);
-                renderAll();
-            }
+            if (mode === 'live') sendLiveAct(optionId);
+            else { applyLocalAction(optionId); renderAll(); }
         } else {
             selectedOptionId = optionId;
             renderOptionsGrid();
@@ -675,12 +724,11 @@
     // ============================================================
 
     function fmtAction(a) {
-        return { PICK:'Pick', BAN:'Ban', SNIPE:'Snipe', STEAL:'Steal',
-            REVEAL_ALL:'Reveal All', REVEAL_PICKS:'Reveal Picks',
-            REVEAL_BANS:'Reveal Bans', REVEAL_SNIPES:'Reveal Snipes',
-            PAUSE:'Pause', RESET_CL:'Reset' }[a] || a;
+        return { PICK: 'Pick', BAN: 'Ban', SNIPE: 'Snipe', STEAL: 'Steal',
+            REVEAL_ALL: 'Reveal All', REVEAL_PICKS: 'Reveal Picks',
+            REVEAL_BANS: 'Reveal Bans', REVEAL_SNIPES: 'Reveal Snipes',
+            PAUSE: 'Pause', RESET_CL: 'Reset' }[a] || a;
     }
-    function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
     function copySpecLink() {
         if (!draft?.spectatorUrl) return;
@@ -707,6 +755,8 @@
         createBtn.textContent = 'Start Draft';
         draft = null; selectedOptionId = null;
         liveConnected = false; livePending = false;
+        lastLookedUpId = '';
+        presetPreview.classList.add('hidden');
     }
 
     if ('serviceWorker' in navigator) {

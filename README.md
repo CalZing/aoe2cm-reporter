@@ -1,84 +1,80 @@
 # AoE2 CM Reporter
 
-**Fysisk draft-reporter för [aoe2cm.net](https://aoe2cm.net)**
+**Physical draft reporter for [aoe2cm.net](https://aoe2cm.net)**
 
-En webbapp som låter en domare rapportera en fysisk AoE2 Captains Mode-draft.
-Draften körs **helt lokalt** utan tidsbegränsning. När alla val är gjorda laddas
-resultatet upp till aoe2cm.net, där det syns som en vanlig avslutad draft.
+A web app that lets a referee report a physical Age of Empires II Captains Mode
+draft. The result is published to aoe2cm.net where spectators can view it.
 
-## Så funkar det
+## Modes
 
-Appen har två lägen:
+### 📋 Post-draft (default)
+Run the entire draft locally with no time pressure. When all picks/bans are done,
+the app uploads the result to aoe2cm.net in one go. Undo is available.
 
-### 📋 Post-draft (standard)
+### 📡 Live
+Each pick/ban is sent to aoe2cm.net in real-time (30s timer per turn). Spectators
+see the draft unfold step by step. No undo.
+
+Both modes create the draft on aoe2cm.net immediately at setup, so the spectator
+URL is available before the first pick.
+
+## Preset input
+
+The preset field accepts any of:
+- A raw preset ID: `WBp4y`
+- A full URL: `https://aoe2cm.net/preset/WBp4y`
+
+The preset name is shown automatically as you type or paste.
+
+## Direct links
+
+You can pre-fill the preset by adding it to the URL:
 ```
-1. Skapa preset    →  aoe2cm.net
-2. Starta draft    →  Appen skapar draft + spectator-URL direkt
-3. Kör draft       →  Helt lokalt, ingen timer, undo-knapp
-4. Upload          →  Appen spelar upp alla events automatiskt
-5. Se resultat     →  aoe2cm.net/draft/<id>
+https://your-host.com/?preset=WBp4y
 ```
-Bäst för: fysiska drafts, brädspels-draften, situationer där man vill
-kunna ta sin tid.
+This is useful for sending a ready-to-go link to a less technical referee.
 
-### 📡 Live (med timer)
-```
-1. Skapa preset    →  aoe2cm.net
-2. Starta draft    →  Appen skapar draft + ansluter direkt
-3. Rapportera live →  Varje val skickas direkt (30s timer per val)
-4. Klart           →  Spectators ser allt i realtid
-```
-Bäst för: matcher där spectators vill följa draften steg för steg i
-realtid på stream.
+## Installation
 
-## Installation (Windows)
+Requires [Node.js](https://nodejs.org) (LTS, v18+).
 
-### 1. Installera Node.js
-
-Ladda ner från [nodejs.org](https://nodejs.org) (LTS-versionen). Kör installern.
-
-Verifiera i cmd/PowerShell:
-```
-node --version
-npm --version
-```
-
-### 2. Packa upp och installera
-
-```
-cd C:\Users\ditt-namn\Downloads\aoe2cm-reporter
+```bash
+cd aoe2cm-reporter
 npm install
-```
-
-### 3. Starta
-
-```
 npm start
 ```
 
-### 4. Öppna
+Open `http://localhost:3000` in your browser.
 
-Gå till `http://localhost:3000` i din webbläsare.
-
-## iPad-åtkomst
-
-Om iPaden och datorn är på samma WiFi, öppna `http://<datorns-ip>:3000` på iPaden.
-Hitta IP:n med `ipconfig` i cmd.
-
-Tips: I Safari, tryck Dela → Lägg till på hemskärmen för att köra som app.
-
-## Hosta publikt
-
-Om du har en VPS (Linux-server med SSH-access):
+### Change port
 
 ```bash
-# Installera Node.js på servern
-# Kopiera projektfilerna dit
+PORT=8080 npm start
+```
+
+### iPad access
+
+If the iPad and your computer are on the same network, open
+`http://<your-computers-ip>:3000` on the iPad. Find your IP with `ipconfig` (Windows)
+or `ifconfig` (Mac/Linux). In Safari: Share → Add to Home Screen to run it as an app.
+
+## Hosting
+
+### Render (free)
+
+1. Push the repo to GitHub
+2. Go to [render.com](https://render.com), sign in with GitHub
+3. New → Web Service → select the repo
+4. Build Command: `npm install`, Start Command: `npm start`
+5. Free plan works fine
+
+### VPS with nginx
+
+```bash
 npm install
 PORT=3000 npm start
 ```
 
-Med nginx som reverse proxy:
 ```nginx
 server {
     listen 80;
@@ -93,40 +89,30 @@ server {
 }
 ```
 
-## Environment-variabler
+## Architecture
 
-| Variabel | Default | Beskrivning |
+```
+Browser (draft UI)  ◄──Socket.IO──►  Node.js server  ◄──Socket.IO──►  aoe2cm.net
+                                          │
+                                          ├─ POST /api/preset/:id  (fetch preset)
+                                          ├─ POST /api/draft/new   (create draft)
+                                          └─ GET  /images/*        (proxy images)
+```
+
+In **post-draft** mode, all draft logic runs in the browser. The server is only
+used to proxy API calls (CORS) and replay the completed draft via Socket.IO.
+
+In **live** mode, the server maintains two persistent Socket.IO connections to
+aoe2cm.net (one as HOST, one as GUEST) and forwards each action in real-time.
+
+## Environment variables
+
+| Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `3000` | Port att lyssna på |
-| `AOE2CM_URL` | `https://aoe2cm.net` | URL till aoe2cm-servern |
+| `PORT` | `3000` | Port to listen on |
+| `AOE2CM_URL` | `https://aoe2cm.net` | aoe2cm server URL |
 
-## Arkitektur
+## License
 
-```
-┌────────────┐              ┌──────────┐
-│  Webbläsare │  Socket.IO   │  Node.js │
-│  (draft UI) │◄────────────►│  server  │
-└────────────┘              └────┬─────┘
-                                 │
-                Post-draft:      │  Live:
-                1) Hämta preset  │  1) Hämta preset
-                2) Skapa draft   │  2) Skapa draft
-                3) Ladda upp     │  3) Anslut + forward
-                   färdig draft  │     varje act direkt
-                                 ▼
-                           ┌──────────┐
-                           │aoe2cm.net│
-                           └──────────┘
-```
-
-I **post-draft** körs all draft-logik lokalt i webbläsaren. Servern
-behövs bara som proxy mot aoe2cm.net (pga CORS).
-
-I **live-mode** upprätthåller servern två Socket.IO-anslutningar till
-aoe2cm.net (en som HOST, en som GUEST) och vidarebefordrar varje val
-i realtid.
-
-## Licens
-
-Ej associerat med eller godkänt av Microsoft eller Siege Engineers.
+Not associated with or endorsed by Microsoft or Siege Engineers.
 Age of Empires © Microsoft Corporation.
