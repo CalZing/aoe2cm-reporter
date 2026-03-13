@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#1a1410">
+    <title>AoE2 CM Reporter</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚔️</text></svg>">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- SETUP SCREEN -->
+        <div id="setup-screen" class="screen active">
+            <div class="setup-container">
+                <div class="logo-area">
+                    <div class="logo-icon">⚔️</div>
+                    <h1>AoE2 CM Reporter</h1>
+                    <p class="subtitle">Physical Draft → Live on aoe2cm.net</p>
+                </div>
+                <div class="form-group">
+                    <label for="preset-id">Preset ID</label>
+                    <input type="text" id="preset-id" placeholder="e.g. WBp4y or simple" autocomplete="off" autocapitalize="off">
+                    <small class="hint">From the preset URL on aoe2cm.net</small>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="host-name">Host (left)</label>
+                        <input type="text" id="host-name" placeholder="Player 1" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label for="guest-name">Guest (right)</label>
+                        <input type="text" id="guest-name" placeholder="Player 2" autocomplete="off">
+                    </div>
+                </div>
+                <button id="create-btn" class="btn-primary">Create Draft</button>
+                <div id="setup-error" class="error-box hidden"></div>
+                <div id="setup-status" class="status-box hidden"></div>
+            </div>
+        </div>
+
+        <!-- DRAFT SCREEN -->
+        <div id="draft-screen" class="screen">
+            <header id="draft-header">
+                <div class="header-left">
+                    <span id="hdr-host" class="player-name host-color"></span>
+                    <span class="vs">vs</span>
+                    <span id="hdr-guest" class="player-name guest-color"></span>
+                </div>
+                <div class="header-center">
+                    <div id="turn-badge" class="turn-badge">Connecting…</div>
+                </div>
+                <div class="header-right">
+                    <button id="spec-link-btn" class="btn-small" title="Copy spectator link">📋 Spec Link</button>
+                </div>
+            </header>
+
+            <div id="draft-body">
+                <!-- Turn indicator -->
+                <div id="turn-indicator" class="turn-indicator">
+                    <span id="turn-player" class="turn-player"></span>
+                    <span id="turn-action" class="turn-action"></span>
+                    <span id="turn-detail" class="turn-detail"></span>
+                </div>
+
+                <!-- Options grid -->
+                <div id="options-grid" class="options-grid"></div>
+
+                <!-- Event history -->
+                <div id="events-panel" class="events-panel">
+                    <h3>Draft Events</h3>
+                    <div id="events-list" class="events-list"></div>
+                </div>
+            </div>
+
+            <div id="draft-error" class="error-box hidden"></div>
+
+            <!-- Draft complete overlay -->
+            <div id="draft-complete" class="overlay hidden">
+                <div class="overlay-content">
+                    <div class="complete-icon">🏆</div>
+                    <h2>Draft Complete!</h2>
+                    <p>All turns have been reported.</p>
+                    <button id="new-draft-btn" class="btn-primary">New Draft</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js"></script>
+</body>
+</html>
