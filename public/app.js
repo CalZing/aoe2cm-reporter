@@ -1,33 +1,77 @@
-// AoE2 CM Reporter – Frontend
+// AoE2 CM Reporter – Dual mode: Live + Post-draft
 (function () {
     'use strict';
 
+    // --- Civ decoder (mirrors aoe2cm2 CivilisationEncoder) ---
+    const ALL_CIVS = [
+        'Aztecs','Berbers','Britons','Burmese','Byzantines','Celts','Chinese',
+        'Ethiopians','Franks','Goths','Huns','Incas','Indians','Italians',
+        'Japanese','Khmer','Koreans','Magyars','Malay','Malians','Mayans',
+        'Mongols','Persians','Portuguese','Saracens','Slavs','Spanish',
+        'Teutons','Turks','Vietnamese','Vikings','Bulgarians','Cumans',
+        'Lithuanians','Tatars','Burgundians','Sicilians','Bohemians','Poles',
+        'Bengalis','Dravidians','Gurjaras','Hindustanis','Romans',
+        'Armenians','Georgians',
+        'Achaemenids','Athenians','Spartans',
+        'Shu','Wu','Wei','Jurchens','Khitans',
+        'Macedonians','Thracians','Puru',
+        'Mapuche','Muisca','Tupi',
+    ];
+
+    function decodeEncodedCivs(encoded) {
+        if (!encoded) return [];
+        const bits = [];
+        for (const ch of encoded) {
+            const n = parseInt(ch, 16);
+            if (isNaN(n)) return [];
+            bits.push(...n.toString(2).padStart(4, '0').split('').map(b => b === '1'));
+        }
+        const first = bits.indexOf(true);
+        const trimmed = bits.slice(first);
+        const civs = [];
+        for (let i = 0; i < trimmed.length; i++) {
+            if (trimmed[i]) {
+                const idx = trimmed.length - 1 - i;
+                if (idx < ALL_CIVS.length) {
+                    civs.push({
+                        id: ALL_CIVS[idx], name: ALL_CIVS[idx], category: 'default',
+                        imageUrls: {
+                            unit: `/images/civs/${ALL_CIVS[idx].toLowerCase()}.png`,
+                            emblem: `/images/civemblems/${ALL_CIVS[idx].toLowerCase()}.png`,
+                        },
+                    });
+                }
+            }
+        }
+        civs.sort((a, b) => a.name.localeCompare(b.name));
+        return civs;
+    }
+
+    function resolveOptions(preset) {
+        if (preset.draftOptions && preset.draftOptions.length > 0) return preset.draftOptions;
+        if (preset.encodedCivilisations) return decodeEncodedCivs(preset.encodedCivilisations);
+        return [];
+    }
+
     // --- State ---
     let socket = null;
-    let state = {
-        draftId: null,
-        spectatorUrl: '',
-        options: [],         // all draft options (civs/maps)
-        turns: [],           // preset turn sequence
-        hostName: '',
-        guestName: '',
-        nextAction: 0,       // current turn index
-        events: [],          // array of { player, actionType, chosenOptionId, ... }
-        started: false,
-        finished: false,
-        selectedOptionId: null,
-    };
+    let mode = 'post'; // 'post' or 'live'
+    let draft = null;
+    let selectedOptionId = null;
+    let liveConnected = false;  // live mode: server sockets connected?
+    let livePending = false;    // live mode: waiting for server ack?
 
-    // --- DOM refs ---
-    const $ = (sel) => document.querySelector(sel);
+    // --- DOM ---
+    const $ = s => document.querySelector(s);
+    const $$ = s => document.querySelectorAll(s);
     const setupScreen = $('#setup-screen');
     const draftScreen = $('#draft-screen');
+    const uploadScreen = $('#upload-screen');
     const presetInput = $('#preset-id');
     const hostInput = $('#host-name');
     const guestInput = $('#guest-name');
     const createBtn = $('#create-btn');
     const setupError = $('#setup-error');
-    const setupStatus = $('#setup-status');
     const hdrHost = $('#hdr-host');
     const hdrGuest = $('#hdr-guest');
     const turnBadge = $('#turn-badge');
@@ -37,495 +81,636 @@
     const optionsGrid = $('#options-grid');
     const eventsList = $('#events-list');
     const draftError = $('#draft-error');
-    const draftComplete = $('#draft-complete');
+    const uploadBtn = $('#upload-btn');
+    const undoBtn = $('#undo-btn');
     const specLinkBtn = $('#spec-link-btn');
+    const uploadStatus = $('#upload-status');
+    const uploadProgress = $('#upload-progress');
+    const uploadResult = $('#upload-result');
+    const specUrlEl = $('#spec-url');
     const newDraftBtn = $('#new-draft-btn');
 
     // --- Init ---
     function init() {
-        socket = io();
+        socket = io({ transports: ['websocket', 'polling'] });
 
-        socket.on('connect', () => console.log('Connected to server'));
-        socket.on('disconnect', () => console.log('Disconnected from server'));
+        socket.on('connect', () => {
+            console.log('Socket connected:', socket.id);
+            createBtn.disabled = false;
+        });
+        socket.on('connect_error', (err) => {
+            console.error('Socket connection error:', err.message);
+            showError(setupError, 'Cannot connect to server: ' + err.message);
+        });
+        socket.on('disconnect', (reason) => {
+            console.log('Socket disconnected:', reason);
+        });
 
-        socket.on('draft_created', onDraftCreated);
-        socket.on('draft_started', onDraftStarted);
-        socket.on('player_event', onPlayerEvent);
-        socket.on('admin_event', onAdminEvent);
-        socket.on('draft_finished', onDraftFinished);
-        socket.on('error_msg', onError);
+        // Setup
+        createBtn.addEventListener('click', startDraft);
+        $$('.mode-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                $$('.mode-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                mode = btn.dataset.mode;
+                localStorage.setItem('aoe2cm_mode', mode);
+            });
+        });
+        [presetInput, hostInput, guestInput].forEach(el => {
+            el.addEventListener('keydown', e => { if (e.key === 'Enter') startDraft(); });
+        });
 
-        createBtn.addEventListener('click', createDraft);
+        // Draft
+        uploadBtn.addEventListener('click', uploadDraft);
+        undoBtn.addEventListener('click', undoLastAction);
         specLinkBtn.addEventListener('click', copySpecLink);
         newDraftBtn.addEventListener('click', resetToSetup);
 
-        // Enter key on inputs
-        [presetInput, hostInput, guestInput].forEach(el => {
-            el.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') createDraft();
-            });
-        });
+        // Live mode server events
+        socket.on('live_player_event', onLivePlayerEvent);
+        socket.on('live_admin_event', onLiveAdminEvent);
+        socket.on('live_finished', onLiveFinished);
 
-        // Load saved values
+        // Upload events
+        socket.on('upload_progress', onUploadProgress);
+        socket.on('upload_complete', onUploadComplete);
+        socket.on('upload_error', onUploadError);
+
+        // Restore saved values
         presetInput.value = localStorage.getItem('aoe2cm_preset') || '';
         hostInput.value = localStorage.getItem('aoe2cm_host') || '';
         guestInput.value = localStorage.getItem('aoe2cm_guest') || '';
+        const savedMode = localStorage.getItem('aoe2cm_mode');
+        if (savedMode === 'live' || savedMode === 'post') {
+            mode = savedMode;
+            $$('.mode-btn').forEach(b => {
+                b.classList.toggle('active', b.dataset.mode === mode);
+            });
+        }
     }
 
-    // --- Setup ---
-    function createDraft() {
+    // ============================================================
+    // SETUP
+    // ============================================================
+
+    function startDraft() {
         const presetId = presetInput.value.trim();
         const hostName = hostInput.value.trim() || 'Host';
         const guestName = guestInput.value.trim() || 'Guest';
+        if (!presetId) { showError(setupError, 'Enter a preset ID'); return; }
 
-        if (!presetId) {
-            showSetupError('Enter a preset ID');
+        if (!socket.connected) {
+            showError(setupError, 'Not connected to server — waiting for connection…');
             return;
         }
 
-        // Save for next time
+        console.log('startDraft:', { presetId, hostName, guestName, mode });
+
         localStorage.setItem('aoe2cm_preset', presetId);
         localStorage.setItem('aoe2cm_host', hostName);
         localStorage.setItem('aoe2cm_guest', guestName);
 
         createBtn.disabled = true;
-        createBtn.textContent = 'Creating…';
-        hideSetupError();
-        showSetupStatus('Fetching preset and creating draft…');
+        createBtn.textContent = 'Creating draft…';
+        hideError(setupError);
 
-        socket.emit('create_draft', { presetId, hostName, guestName });
+        socket.emit('create_draft', { presetId, hostName, guestName }, (response) => {
+            if (response.error) {
+                createBtn.disabled = false;
+                createBtn.textContent = 'Start Draft';
+                showError(setupError, response.error);
+                return;
+            }
+
+            const preset = response.preset;
+            const options = resolveOptions(preset);
+            if (options.length === 0) {
+                createBtn.disabled = false;
+                createBtn.textContent = 'Start Draft';
+                showError(setupError, 'Preset has no options/civilisations');
+                return;
+            }
+
+            draft = {
+                preset, options,
+                draftId: response.draftId,
+                spectatorUrl: response.spectatorUrl,
+                turns: preset.turns,
+                hostName, guestName,
+                events: [],
+                nextAction: 0,
+            };
+
+            hdrHost.textContent = hostName;
+            hdrGuest.textContent = guestName;
+            selectedOptionId = null;
+            liveConnected = false;
+            livePending = false;
+
+            if (mode === 'live') {
+                initLiveMode();
+            } else {
+                initPostMode();
+            }
+        });
     }
 
-    function onDraftCreated(data) {
-        console.log('Draft created:', data);
-        state.draftId = data.draftId;
-        state.spectatorUrl = data.spectatorUrl;
-        state.options = data.options;
-        state.turns = data.turns;
-        state.hostName = data.hostName;
-        state.guestName = data.guestName;
-        state.nextAction = 0;
-        state.events = [];
-        state.started = false;
-        state.finished = false;
+    // ============================================================
+    // POST-DRAFT MODE (local draft, upload at end)
+    // ============================================================
 
-        showSetupStatus('Draft created! Connecting as both players…');
-
-        // Switch to draft screen
-        hdrHost.textContent = state.hostName;
-        hdrGuest.textContent = state.guestName;
-        turnBadge.textContent = 'Connecting…';
-        turnBadge.className = 'turn-badge waiting';
-
-        renderOptionsGrid();
-        renderEvents();
-
+    function initPostMode() {
+        skipAdminTurns();
+        renderAll();
         setupScreen.classList.remove('active');
         draftScreen.classList.add('active');
+        // Undo visible in post mode
+        undoBtn.classList.remove('always-hidden');
     }
 
-    function onDraftStarted(data) {
-        console.log('Draft started:', data);
-        state.started = true;
-        state.nextAction = data.nextAction;
-        updateTurnDisplay();
+    function skipAdminTurns() {
+        while (draft.nextAction < draft.turns.length) {
+            const turn = draft.turns[draft.nextAction];
+            if (turn.executingPlayer === 'NONE') {
+                draft.events.push({
+                    player: turn.player, executingPlayer: 'NONE',
+                    actionType: 'admin', action: turn.action,
+                    chosenOptionId: null, turnIndex: draft.nextAction,
+                });
+                draft.nextAction++;
+            } else { break; }
+        }
     }
 
-    // --- Draft events ---
-
-    function onPlayerEvent(data) {
-        console.log('Player event:', data);
-
-        state.events.push({
-            player: data.player,
-            executingPlayer: data.executingPlayer,
-            actionType: data.actionType,
-            chosenOptionId: data.chosenOptionId,
-            isRandomlyChosen: data.isRandomlyChosen,
-            turnIndex: data.turnIndex,
+    function applyLocalAction(optionId) {
+        const turn = getCurrentTurn();
+        if (!turn || turn.executingPlayer === 'NONE') return;
+        const actionMap = { PICK:'pick', BAN:'ban', SNIPE:'snipe', STEAL:'steal' };
+        draft.events.push({
+            player: turn.player, executingPlayer: turn.executingPlayer,
+            actionType: actionMap[turn.action] || turn.action.toLowerCase(),
+            chosenOptionId: optionId, turnIndex: draft.nextAction,
         });
-        state.nextAction = data.nextAction;
-        state.selectedOptionId = null;
+        draft.nextAction++;
+        skipAdminTurns();
+    }
 
+    function undoLastAction() {
+        if (mode === 'live' || !draft || draft.events.length === 0) return;
+        while (draft.events.length > 0) {
+            const last = draft.events[draft.events.length - 1];
+            draft.events.pop();
+            draft.nextAction = last.turnIndex;
+            if (last.actionType !== 'admin') break;
+        }
+        if (draft.events.length > 0) {
+            draft.nextAction = draft.events[draft.events.length - 1].turnIndex + 1;
+            skipAdminTurns();
+        } else {
+            draft.nextAction = 0;
+            skipAdminTurns();
+        }
+        selectedOptionId = null;
+        renderAll();
+    }
+
+    // ============================================================
+    // LIVE MODE (real-time via server sockets)
+    // ============================================================
+
+    function initLiveMode() {
+        // Show draft screen with "connecting" state
+        turnBadge.textContent = 'Connecting…';
+        turnBadge.className = 'turn-badge waiting';
         renderOptionsGrid();
         renderEvents();
-        updateTurnDisplay();
+        undoBtn.classList.add('always-hidden'); // no undo in live mode
+        uploadBtn.classList.add('hidden');
+        setupScreen.classList.remove('active');
+        draftScreen.classList.add('active');
 
-        // Check if done
-        if (state.nextAction >= state.turns.length && !hasRemainingNonAdminTurns()) {
-            // Might still have admin turns; wait for server
-        }
-
-        hideDraftError();
-    }
-
-    function onAdminEvent(data) {
-        console.log('Admin event:', data);
-
-        state.events.push({
-            player: data.player,
-            actionType: 'admin',
-            action: data.action,
-            turnIndex: data.turnIndex,
+        socket.emit('live_connect', {
+            draftId: draft.draftId,
+            hostName: draft.hostName,
+            guestName: draft.guestName,
+        }, (response) => {
+            if (response.error) {
+                showDraftError(`Connection failed: ${response.error}`);
+                return;
+            }
+            liveConnected = true;
+            // Skip leading admin turns in our local tracking
+            skipAdminTurns();
+            renderAll();
         });
-        state.nextAction = data.nextAction;
-
-        // After a reveal, we may need to update shown events with revealed data
-        if (data.events) {
-            // The server sends updated events array after reveals
-            // We could update our events, but for the reporter it's not critical
-            // since they already know what was picked
-        }
-
-        renderEvents();
-        updateTurnDisplay();
-        hideDraftError();
     }
 
-    function onDraftFinished() {
-        console.log('Draft finished!');
-        state.finished = true;
-        draftComplete.classList.remove('hidden');
+    function onLivePlayerEvent(event) {
+        if (!draft) return;
+        // The server confirmed this event happened. Update local state.
+        const HIDDEN_IDS = ['HIDDEN_PICK','HIDDEN_BAN','HIDDEN_SNIPE','HIDDEN_STEAL','HIDDEN'];
+        let resolvedId = event.chosenOptionId;
+        // If the event came back as hidden (opponent's hidden turn from HOST perspective),
+        // but WE sent it, we know what it was from our pending act
+        if (HIDDEN_IDS.includes(resolvedId) && livePending && draft._pendingOptionId) {
+            resolvedId = draft._pendingOptionId;
+        }
+        livePending = false;
+        draft._pendingOptionId = null;
+
+        draft.events.push({
+            player: event.player, executingPlayer: event.executingPlayer,
+            actionType: event.actionType, chosenOptionId: resolvedId,
+            turnIndex: draft.nextAction,
+        });
+        draft.nextAction++;
+        skipAdminTurns();
+        selectedOptionId = null;
+        renderAll();
     }
 
-    function onError(data) {
-        console.error('Error:', data);
-        if (setupScreen.classList.contains('active')) {
-            showSetupError(data.message);
-            createBtn.disabled = false;
-            createBtn.textContent = 'Create Draft';
-            hideSetupStatus();
-        } else {
-            showDraftError(data.message);
-        }
+    function onLiveAdminEvent(event) {
+        if (!draft) return;
+        draft.events.push({
+            player: event.player, executingPlayer: 'NONE',
+            actionType: 'admin', action: event.action,
+            chosenOptionId: null, turnIndex: draft.nextAction,
+        });
+        draft.nextAction++;
+        skipAdminTurns();
+        renderAll();
     }
 
-    // --- Rendering ---
+    function onLiveFinished() {
+        if (!draft) return;
+        draft.finished = true;
+        showDraftComplete();
+    }
 
-    function renderOptionsGrid() {
-        optionsGrid.innerHTML = '';
+    function sendLiveAct(optionId) {
+        if (!liveConnected || livePending) return;
+        const turn = getCurrentTurn();
+        if (!turn || turn.executingPlayer === 'NONE') return;
+        const actionMap = { PICK:'pick', BAN:'ban', SNIPE:'snipe', STEAL:'steal' };
+        livePending = true;
+        draft._pendingOptionId = optionId;
 
-        // Group by category
-        const categories = new Map();
-        for (const opt of state.options) {
-            const cat = opt.category || 'default';
-            if (!categories.has(cat)) categories.set(cat, []);
-            categories.get(cat).push(opt);
-        }
+        turnBadge.textContent = 'Sending…';
+        turnBadge.className = 'turn-badge waiting';
 
-        // Get current turn info for category filtering
-        const currentTurn = state.turns[state.nextAction];
-        const turnCategories = currentTurn?.categories || ['default'];
-
-        for (const [cat, opts] of categories) {
-            // If this category isn't relevant to the current turn, dim it
-            const isTurnCategory = turnCategories.includes(cat);
-
-            if (categories.size > 1) {
-                const catHeader = document.createElement('div');
-                catHeader.className = 'category-header';
-                catHeader.textContent = cat === 'default' ? 'Civilisations' : capitalize(cat);
-                optionsGrid.appendChild(catHeader);
+        socket.emit('live_act', {
+            player: turn.player,
+            executingPlayer: turn.executingPlayer,
+            actionType: actionMap[turn.action] || turn.action.toLowerCase(),
+            chosenOptionId: optionId,
+        }, (response) => {
+            if (response.error) {
+                livePending = false;
+                draft._pendingOptionId = null;
+                showDraftError(response.error);
+                renderTurnIndicator();
             }
-
-            const grid = document.createElement('div');
-            grid.className = 'options-subgrid';
-            optionsGrid.appendChild(grid);
-
-            for (const opt of opts) {
-                const optState = getOptionState(opt.id);
-                const el = document.createElement('div');
-                el.className = `option-card ${optState.cssClass}`;
-                el.dataset.optionId = opt.id;
-
-                if (!isTurnCategory && state.started && !state.finished) {
-                    el.classList.add('wrong-category');
-                }
-
-                if (state.selectedOptionId === opt.id) {
-                    el.classList.add('selected');
-                }
-
-                // Image
-                const img = document.createElement('img');
-                img.src = opt.imageUrls?.emblem || opt.imageUrls?.unit || '';
-                img.alt = opt.name || opt.id;
-                img.loading = 'lazy';
-                img.onerror = function() {
-                    // Fallback: try unit image, then placeholder
-                    if (this.src.includes('emblem')) {
-                        this.src = opt.imageUrls?.unit || '';
-                    } else {
-                        this.style.display = 'none';
-                    }
-                };
-                el.appendChild(img);
-
-                // Name
-                const name = document.createElement('span');
-                name.className = 'option-name';
-                name.textContent = opt.name || opt.id;
-                el.appendChild(name);
-
-                // State badge
-                if (optState.badge) {
-                    const badge = document.createElement('span');
-                    badge.className = `option-badge ${optState.badgeClass}`;
-                    badge.textContent = optState.badge;
-                    el.appendChild(badge);
-                }
-
-                // Click handler
-                if (state.started && !state.finished && optState.available && isTurnCategory) {
-                    el.addEventListener('click', () => onOptionClick(opt.id));
-                }
-
-                grid.appendChild(el);
-            }
-        }
+            // Success: wait for live_player_event from server
+        });
     }
 
-    function getOptionState(optionId) {
-        // Check all events to determine this option's state
-        let result = { available: true, cssClass: 'available', badge: null, badgeClass: '' };
+    // ============================================================
+    // UPLOAD (post-draft mode)
+    // ============================================================
 
-        for (let i = 0; i < state.events.length; i++) {
-            const evt = state.events[i];
-            if (evt.chosenOptionId !== optionId) continue;
+    function uploadDraft() {
+        if (!draft || !isDraftComplete()) return;
+        uploadBtn.disabled = true;
+        const eventsForUpload = draft.events.filter(e => e.actionType !== 'admin');
+
+        draftScreen.classList.remove('active');
+        uploadScreen.classList.add('active');
+        uploadStatus.textContent = 'Connecting to aoe2cm.net…';
+        uploadProgress.style.width = '5%';
+        specUrlEl.href = draft.spectatorUrl;
+        specUrlEl.textContent = draft.spectatorUrl;
+
+        socket.emit('upload_draft', {
+            draftId: draft.draftId, preset: draft.preset,
+            hostName: draft.hostName, guestName: draft.guestName,
+            events: eventsForUpload,
+        }, (response) => {
+            if (response?.error) {
+                uploadStatus.textContent = `Error: ${response.error}`;
+                uploadProgress.style.width = '0%';
+                uploadBtn.disabled = false;
+                draftScreen.classList.add('active');
+                uploadScreen.classList.remove('active');
+            }
+        });
+    }
+
+    function onUploadProgress(data) {
+        if (data.phase === 'connected') {
+            uploadStatus.textContent = 'Connected. Replaying events…';
+            uploadProgress.style.width = '30%';
+        } else if (data.phase === 'replaying') {
+            const pct = 30 + (data.current / data.total) * 65;
+            uploadProgress.style.width = `${pct}%`;
+            uploadStatus.textContent = `Replaying ${data.current}/${data.total}…`;
+        }
+    }
+    function onUploadComplete() {
+        uploadProgress.style.width = '100%';
+        uploadStatus.textContent = 'Upload complete!';
+        uploadResult.classList.remove('hidden');
+    }
+    function onUploadError(data) {
+        uploadStatus.textContent = `Error: ${data.message}`;
+    }
+
+    // ============================================================
+    // SHARED DRAFT LOGIC
+    // ============================================================
+
+    function getCurrentTurn() {
+        if (!draft || draft.nextAction >= draft.turns.length) return null;
+        return draft.turns[draft.nextAction];
+    }
+
+    function isDraftComplete() {
+        return draft && draft.nextAction >= draft.turns.length;
+    }
+
+    // --- Availability ---
+    function computeAvailableOptions() {
+        const allIds = draft.options.map(o => o.id);
+        const h = { pick: new Set(allIds), ban: new Set(allIds), snipe: new Set(), steal: new Set() };
+        const g = { pick: new Set(allIds), ban: new Set(allIds), snipe: new Set(), steal: new Set() };
+
+        for (const evt of draft.events) {
             if (evt.actionType === 'admin') continue;
-
-            const turn = state.turns[evt.turnIndex];
+            const turn = draft.turns[evt.turnIndex];
             if (!turn) continue;
+            const id = evt.chosenOptionId;
+            const ex = turn.exclusivity;
+            const isH = evt.player === 'HOST';
 
-            const isHost = evt.player === 'HOST';
-            const playerLabel = isHost ? 'H' : 'G';
-
-            switch (evt.actionType) {
-                case 'pick':
-                    result.available = false;
-                    result.cssClass = isHost ? 'picked-host' : 'picked-guest';
-                    result.badge = `${playerLabel} Pick`;
-                    result.badgeClass = isHost ? 'badge-host' : 'badge-guest';
-                    break;
-                case 'ban':
-                    result.available = false;
-                    result.cssClass = 'banned';
-                    result.badge = `${playerLabel} Ban`;
-                    result.badgeClass = 'badge-ban';
-                    break;
-                case 'snipe':
-                    result.available = false;
-                    result.cssClass = 'sniped';
-                    result.badge = `${playerLabel} Snipe`;
-                    result.badgeClass = 'badge-snipe';
-                    break;
-                case 'steal':
-                    result.available = false;
-                    result.cssClass = isHost ? 'picked-host' : 'picked-guest';
-                    result.badge = `${playerLabel} Steal`;
-                    result.badgeClass = isHost ? 'badge-host' : 'badge-guest';
-                    break;
+            if (evt.actionType === 'pick') {
+                if (ex === 'GLOBAL') { h.pick.delete(id); h.ban.delete(id); g.pick.delete(id); g.ban.delete(id); }
+                else if (ex === 'EXCLUSIVE') { if (isH) { h.pick.delete(id); g.ban.delete(id); } else { g.pick.delete(id); h.ban.delete(id); } }
+                if (isH) { g.snipe.add(id); g.steal.add(id); } else { h.snipe.add(id); h.steal.add(id); }
+            }
+            if (evt.actionType === 'ban') {
+                if (ex === 'GLOBAL') { h.pick.delete(id); h.ban.delete(id); g.pick.delete(id); g.ban.delete(id); }
+                else if (ex === 'EXCLUSIVE') { if (isH) { g.pick.delete(id); h.ban.delete(id); } else { h.pick.delete(id); g.ban.delete(id); } }
+                else { if (isH) g.pick.delete(id); else h.pick.delete(id); }
+            }
+            if (evt.actionType === 'snipe') {
+                if (isH) { h.snipe.delete(id); h.steal.delete(id); } else { g.snipe.delete(id); g.steal.delete(id); }
+            }
+            if (evt.actionType === 'steal') {
+                if (isH) { h.snipe.delete(id); h.steal.delete(id); } else { g.snipe.delete(id); g.steal.delete(id); }
+                if (isH) { g.snipe.add(id); g.steal.add(id); } else { h.snipe.add(id); h.steal.add(id); }
             }
         }
+        return { host: h, guest: g };
+    }
 
-        if (state.finished) result.available = false;
-
+    function getValidIdsForCurrentTurn() {
+        const turn = getCurrentTurn();
+        if (!turn || turn.executingPlayer === 'NONE') return new Set();
+        const valid = computeAvailableOptions();
+        const pv = turn.player === 'HOST' ? valid.host : valid.guest;
+        const am = { PICK:'pick', BAN:'ban', SNIPE:'snipe', STEAL:'steal' };
+        const pool = pv[am[turn.action]];
+        if (!pool) return new Set();
+        const cats = turn.categories || ['default'];
+        const result = new Set();
+        for (const id of pool) {
+            const opt = draft.options.find(o => o.id === id);
+            if (opt && cats.includes(opt.category || 'default')) result.add(id);
+        }
         return result;
     }
 
-    function renderEvents() {
-        eventsList.innerHTML = '';
-
-        for (let i = 0; i < state.events.length; i++) {
-            const evt = state.events[i];
-            const el = document.createElement('div');
-            el.className = 'event-item';
-
-            if (evt.actionType === 'admin') {
-                el.classList.add('event-admin');
-                el.innerHTML = `<span class="event-num">${i + 1}</span>
-                    <span class="event-text">⚙️ ${formatAction(evt.action)}</span>`;
-            } else {
-                const isHost = evt.player === 'HOST';
-                const name = isHost ? state.hostName : state.guestName;
-                const optName = getOptionName(evt.chosenOptionId);
-                el.classList.add(isHost ? 'event-host' : 'event-guest');
-                el.innerHTML = `<span class="event-num">${i + 1}</span>
-                    <span class="event-player ${isHost ? 'host-color' : 'guest-color'}">${name}</span>
-                    <span class="event-action-type">${evt.actionType}</span>
-                    <span class="event-option">${optName}</span>`;
+    function getOptionDisplayState(optionId) {
+        const r = { available: true, cssClass: 'available', badge: null, badgeClass: '' };
+        for (const evt of draft.events) {
+            if (evt.chosenOptionId !== optionId || evt.actionType === 'admin') continue;
+            const isH = evt.player === 'HOST';
+            const p = isH ? 'H' : 'G';
+            switch (evt.actionType) {
+                case 'pick': r.cssClass = isH?'picked-host':'picked-guest'; r.badge=`${p} Pick`; r.badgeClass=isH?'badge-host':'badge-guest'; r.available=false; break;
+                case 'ban': r.cssClass='banned'; r.badge=`${p} Ban`; r.badgeClass='badge-ban'; r.available=false; break;
+                case 'snipe': r.cssClass='sniped'; r.badge=`${p} Snipe`; r.badgeClass='badge-snipe'; r.available=false; break;
+                case 'steal': r.cssClass=isH?'picked-host':'picked-guest'; r.badge=`${p} Steal`; r.badgeClass=isH?'badge-host':'badge-guest'; r.available=false; break;
             }
-
-            eventsList.appendChild(el);
         }
-
-        // Scroll to bottom
-        eventsList.scrollTop = eventsList.scrollHeight;
+        return r;
     }
 
-    function updateTurnDisplay() {
-        if (!state.started) {
-            turnBadge.textContent = 'Waiting…';
-            turnBadge.className = 'turn-badge waiting';
-            return;
-        }
+    // ============================================================
+    // RENDERING
+    // ============================================================
 
-        // Skip to next non-admin turn for display
-        let displayIndex = state.nextAction;
-        while (displayIndex < state.turns.length && state.turns[displayIndex].executingPlayer === 'NONE') {
-            displayIndex++;
-        }
+    function renderAll() {
+        renderTurnIndicator();
+        renderOptionsGrid();
+        renderEvents();
+        renderButtons();
+    }
 
-        if (displayIndex >= state.turns.length) {
-            turnBadge.textContent = 'Complete';
+    function renderTurnIndicator() {
+        if (isDraftComplete()) {
+            turnBadge.textContent = mode === 'live' ? 'Draft Complete' : 'Draft Complete — Ready to upload';
             turnBadge.className = 'turn-badge complete';
             turnPlayer.textContent = '';
-            turnAction.textContent = 'Draft complete!';
+            turnAction.textContent = mode === 'live' ? 'All turns done!' : 'All turns done — press Upload below';
             turnDetail.textContent = '';
-            state.finished = true;
-            draftComplete.classList.remove('hidden');
+            if (mode === 'live') showDraftComplete();
+            return;
+        }
+        const turn = getCurrentTurn();
+        if (!turn) return;
+        if (mode === 'live' && !liveConnected) {
+            turnBadge.textContent = 'Connecting…';
+            turnBadge.className = 'turn-badge waiting';
+            turnPlayer.textContent = ''; turnAction.textContent = ''; turnDetail.textContent = '';
             return;
         }
 
-        const turn = state.turns[displayIndex];
-        const isHost = turn.player === 'HOST';
-        const playerName = isHost ? state.hostName : state.guestName;
-
-        turnBadge.textContent = `${playerName} – ${formatAction(turn.action)}`;
-        turnBadge.className = `turn-badge ${isHost ? 'host-turn' : 'guest-turn'}`;
-
-        turnPlayer.textContent = playerName;
-        turnPlayer.className = `turn-player ${isHost ? 'host-color' : 'guest-color'}`;
-        turnAction.textContent = formatAction(turn.action);
-        turnAction.className = `turn-action action-${turn.action.toLowerCase().replace('_', '-')}`;
+        const isH = turn.player === 'HOST';
+        const name = isH ? draft.hostName : draft.guestName;
+        turnBadge.textContent = `${name} — ${fmtAction(turn.action)}`;
+        turnBadge.className = `turn-badge ${isH ? 'host-turn' : 'guest-turn'}`;
+        turnPlayer.textContent = name;
+        turnPlayer.className = `turn-player ${isH ? 'host-color' : 'guest-color'}`;
+        turnAction.textContent = fmtAction(turn.action);
+        turnAction.className = `turn-action action-${turn.action.toLowerCase()}`;
 
         const details = [];
         if (turn.hidden) details.push('Hidden');
         if (turn.parallel) details.push('Parallel');
         if (turn.exclusivity === 'GLOBAL') details.push('Global');
-        if (turn.exclusivity === 'EXCLUSIVE') details.push('Exclusive');
-        turnDetail.textContent = details.length ? `(${details.join(', ')})` : '';
-
-        // Also count remaining turns
+        else if (turn.exclusivity === 'EXCLUSIVE') details.push('Exclusive');
         let remaining = 0;
-        for (let i = state.nextAction; i < state.turns.length; i++) {
-            if (state.turns[i].executingPlayer !== 'NONE') remaining++;
+        for (let i = draft.nextAction; i < draft.turns.length; i++) {
+            if (draft.turns[i].executingPlayer !== 'NONE') remaining++;
         }
-        turnDetail.textContent += ` — ${remaining} turns left`;
+        turnDetail.textContent = (details.length ? `(${details.join(', ')}) — ` : '') + `${remaining} turns left`;
     }
 
-    // --- Option interaction ---
+    function renderOptionsGrid() {
+        optionsGrid.innerHTML = '';
+        if (!draft) return;
+        const validIds = isDraftComplete() ? new Set() : getValidIdsForCurrentTurn();
+        const cats = new Map();
+        for (const opt of draft.options) {
+            const c = opt.category || 'default';
+            if (!cats.has(c)) cats.set(c, []);
+            cats.get(c).push(opt);
+        }
+
+        for (const [cat, opts] of cats) {
+            if (cats.size > 1) {
+                const h = document.createElement('div');
+                h.className = 'category-header';
+                h.textContent = cat === 'default' ? 'Civilisations' : cap(cat);
+                optionsGrid.appendChild(h);
+            }
+            const grid = document.createElement('div');
+            grid.className = 'options-subgrid';
+            optionsGrid.appendChild(grid);
+
+            for (const opt of opts) {
+                const ds = getOptionDisplayState(opt.id);
+                const isValid = validIds.has(opt.id);
+                const el = document.createElement('div');
+                el.className = `option-card ${ds.cssClass}`;
+                if (!isValid && !isDraftComplete()) el.classList.add('unavailable');
+                if (selectedOptionId === opt.id) el.classList.add('selected');
+
+                const img = document.createElement('img');
+                img.src = opt.imageUrls?.emblem || opt.imageUrls?.unit || '';
+                img.alt = opt.name || opt.id; img.loading = 'lazy';
+                img.onerror = function() {
+                    if (this.src.includes('emblem')) this.src = opt.imageUrls?.unit || '';
+                    else this.style.display = 'none';
+                };
+                el.appendChild(img);
+
+                const nameEl = document.createElement('span');
+                nameEl.className = 'option-name';
+                nameEl.textContent = opt.name || opt.id;
+                el.appendChild(nameEl);
+
+                if (ds.badge) {
+                    const badge = document.createElement('span');
+                    badge.className = `option-badge ${ds.badgeClass}`;
+                    badge.textContent = ds.badge;
+                    el.appendChild(badge);
+                }
+
+                const canClick = isValid && !isDraftComplete() && !(mode === 'live' && livePending);
+                if (canClick) el.addEventListener('click', () => onOptionClick(opt.id));
+                grid.appendChild(el);
+            }
+        }
+    }
+
+    function renderEvents() {
+        if (!draft) return;
+        eventsList.innerHTML = '';
+        for (let i = 0; i < draft.events.length; i++) {
+            const evt = draft.events[i];
+            const el = document.createElement('div');
+            el.className = 'event-item';
+            if (evt.actionType === 'admin') {
+                el.classList.add('event-admin');
+                el.innerHTML = `<span class="event-num">${i+1}</span><span class="event-text">⚙️ ${fmtAction(evt.action)}</span>`;
+            } else {
+                const isH = evt.player === 'HOST';
+                el.classList.add(isH ? 'event-host' : 'event-guest');
+                el.innerHTML = `<span class="event-num">${i+1}</span>
+                    <span class="event-player ${isH?'host-color':'guest-color'}">${isH?draft.hostName:draft.guestName}</span>
+                    <span class="event-action-type">${evt.actionType}</span>
+                    <span class="event-option">${evt.chosenOptionId}</span>`;
+            }
+            eventsList.appendChild(el);
+        }
+        eventsList.scrollTop = eventsList.scrollHeight;
+    }
+
+    function renderButtons() {
+        if (!draft) return;
+        const hasPlayerEvents = draft.events.some(e => e.actionType !== 'admin');
+        undoBtn.classList.toggle('hidden', mode === 'live' || !hasPlayerEvents);
+        uploadBtn.classList.toggle('hidden', mode === 'live' || !isDraftComplete());
+    }
+
+    function showDraftComplete() {
+        // For live mode, the draft is done — just show a message
+        turnBadge.textContent = 'Draft Complete';
+        turnBadge.className = 'turn-badge complete';
+    }
+
+    // ============================================================
+    // INTERACTION
+    // ============================================================
 
     function onOptionClick(optionId) {
-        if (state.selectedOptionId === optionId) {
-            // Double-click / confirm: send the act
-            confirmAction(optionId);
+        if (selectedOptionId === optionId) {
+            // Second tap: confirm
+            selectedOptionId = null;
+            if (mode === 'live') {
+                sendLiveAct(optionId);
+            } else {
+                applyLocalAction(optionId);
+                renderAll();
+            }
         } else {
-            // First click: select
-            state.selectedOptionId = optionId;
+            selectedOptionId = optionId;
             renderOptionsGrid();
         }
     }
 
-    function confirmAction(optionId) {
-        console.log('Confirming action:', optionId);
-        socket.emit('act', { chosenOptionId: optionId });
+    // ============================================================
+    // HELPERS
+    // ============================================================
 
-        // Optimistically mark as pending
-        state.selectedOptionId = null;
-        turnBadge.textContent = 'Sending…';
-        turnBadge.className = 'turn-badge waiting';
+    function fmtAction(a) {
+        return { PICK:'Pick', BAN:'Ban', SNIPE:'Snipe', STEAL:'Steal',
+            REVEAL_ALL:'Reveal All', REVEAL_PICKS:'Reveal Picks',
+            REVEAL_BANS:'Reveal Bans', REVEAL_SNIPES:'Reveal Snipes',
+            PAUSE:'Pause', RESET_CL:'Reset' }[a] || a;
     }
-
-    // --- Helpers ---
-
-    function getOptionName(id) {
-        const opt = state.options.find(o => o.id === id);
-        return opt?.name || id;
-    }
-
-    function formatAction(action) {
-        const map = {
-            'PICK': 'Pick',
-            'BAN': 'Ban',
-            'SNIPE': 'Snipe',
-            'STEAL': 'Steal',
-            'REVEAL_ALL': 'Reveal All',
-            'REVEAL_PICKS': 'Reveal Picks',
-            'REVEAL_BANS': 'Reveal Bans',
-            'REVEAL_SNIPES': 'Reveal Snipes',
-            'PAUSE': 'Pause',
-            'RESET_CL': 'Reset',
-        };
-        return map[action] || action;
-    }
-
-    function capitalize(s) {
-        return s.charAt(0).toUpperCase() + s.slice(1);
-    }
-
-    function hasRemainingNonAdminTurns() {
-        for (let i = state.nextAction; i < state.turns.length; i++) {
-            if (state.turns[i].executingPlayer !== 'NONE') return true;
-        }
-        return false;
-    }
+    function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
     function copySpecLink() {
-        if (state.spectatorUrl) {
-            navigator.clipboard.writeText(state.spectatorUrl).then(() => {
-                specLinkBtn.textContent = '✅ Copied!';
-                setTimeout(() => { specLinkBtn.textContent = '📋 Spec Link'; }, 2000);
-            }).catch(() => {
-                // Fallback
-                prompt('Spectator URL:', state.spectatorUrl);
-            });
-        }
+        if (!draft?.spectatorUrl) return;
+        navigator.clipboard.writeText(draft.spectatorUrl).then(() => {
+            specLinkBtn.textContent = '✅ Copied!';
+            setTimeout(() => { specLinkBtn.textContent = '📋 Spec'; }, 2000);
+        }).catch(() => prompt('Spectator URL:', draft.spectatorUrl));
+    }
+
+    function showError(el, msg) { el.textContent = msg; el.classList.remove('hidden'); }
+    function hideError(el) { el.classList.add('hidden'); }
+    function showDraftError(msg) {
+        draftError.textContent = msg; draftError.classList.remove('hidden');
+        setTimeout(() => draftError.classList.add('hidden'), 5000);
     }
 
     function resetToSetup() {
+        uploadScreen.classList.remove('active');
         draftScreen.classList.remove('active');
         setupScreen.classList.add('active');
-        draftComplete.classList.add('hidden');
+        uploadResult.classList.add('hidden');
+        uploadBtn.disabled = false;
         createBtn.disabled = false;
-        createBtn.textContent = 'Create Draft';
-        hideSetupError();
-        hideSetupStatus();
-        state = {
-            draftId: null, spectatorUrl: '', options: [], turns: [],
-            hostName: '', guestName: '', nextAction: 0, events: [],
-            started: false, finished: false, selectedOptionId: null,
-        };
+        createBtn.textContent = 'Start Draft';
+        draft = null; selectedOptionId = null;
+        liveConnected = false; livePending = false;
     }
 
-    function showSetupError(msg) {
-        setupError.textContent = msg;
-        setupError.classList.remove('hidden');
-    }
-    function hideSetupError() {
-        setupError.classList.add('hidden');
-    }
-    function showSetupStatus(msg) {
-        setupStatus.textContent = msg;
-        setupStatus.classList.remove('hidden');
-    }
-    function hideSetupStatus() {
-        setupStatus.classList.add('hidden');
-    }
-    function showDraftError(msg) {
-        draftError.textContent = msg;
-        draftError.classList.remove('hidden');
-        setTimeout(hideDraftError, 5000);
-    }
-    function hideDraftError() {
-        draftError.classList.add('hidden');
-    }
-
-    // --- PWA registration ---
     if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('/sw.js').catch(() => {});
     }
-
-    // --- Boot ---
     document.addEventListener('DOMContentLoaded', init);
 })();

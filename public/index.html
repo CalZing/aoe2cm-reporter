@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="theme-color" content="#1a1410">
+    <meta name="theme-color" content="#121010">
     <title>AoE2 CM Reporter</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚔️</text></svg>">
@@ -19,11 +19,26 @@
                 <div class="logo-area">
                     <div class="logo-icon">⚔️</div>
                     <h1>AoE2 CM Reporter</h1>
-                    <p class="subtitle">Physical Draft → Live on aoe2cm.net</p>
+                    <p class="subtitle">Report a physical draft to aoe2cm.net</p>
                 </div>
+
+                <div class="form-group">
+                    <label>Mode</label>
+                    <div class="mode-selector">
+                        <button class="mode-btn active" data-mode="post">
+                            <span class="mode-title">📋 Post-draft</span>
+                            <span class="mode-desc">No timer. Upload when done.</span>
+                        </button>
+                        <button class="mode-btn" data-mode="live">
+                            <span class="mode-title">📡 Live</span>
+                            <span class="mode-desc">30s timer. Spectators see it live.</span>
+                        </button>
+                    </div>
+                </div>
+
                 <div class="form-group">
                     <label for="preset-id">Preset ID</label>
-                    <input type="text" id="preset-id" placeholder="e.g. WBp4y or simple" autocomplete="off" autocapitalize="off">
+                    <input type="text" id="preset-id" placeholder="e.g. WBp4y" autocomplete="off" autocapitalize="off">
                     <small class="hint">From the preset URL on aoe2cm.net</small>
                 </div>
                 <div class="form-row">
@@ -36,9 +51,8 @@
                         <input type="text" id="guest-name" placeholder="Player 2" autocomplete="off">
                     </div>
                 </div>
-                <button id="create-btn" class="btn-primary">Create Draft</button>
+                <button id="create-btn" class="btn-primary">Start Draft</button>
                 <div id="setup-error" class="error-box hidden"></div>
-                <div id="setup-status" class="status-box hidden"></div>
             </div>
         </div>
 
@@ -51,40 +65,47 @@
                     <span id="hdr-guest" class="player-name guest-color"></span>
                 </div>
                 <div class="header-center">
-                    <div id="turn-badge" class="turn-badge">Connecting…</div>
+                    <div id="turn-badge" class="turn-badge"></div>
                 </div>
                 <div class="header-right">
-                    <button id="spec-link-btn" class="btn-small" title="Copy spectator link">📋 Spec Link</button>
+                    <button id="spec-link-btn" class="btn-small" title="Copy spectator link">📋 Spec</button>
+                    <button id="undo-btn" class="btn-small hidden" title="Undo last action">↩ Undo</button>
                 </div>
             </header>
 
             <div id="draft-body">
-                <!-- Turn indicator -->
                 <div id="turn-indicator" class="turn-indicator">
                     <span id="turn-player" class="turn-player"></span>
                     <span id="turn-action" class="turn-action"></span>
                     <span id="turn-detail" class="turn-detail"></span>
                 </div>
-
-                <!-- Options grid -->
                 <div id="options-grid" class="options-grid"></div>
-
-                <!-- Event history -->
                 <div id="events-panel" class="events-panel">
                     <h3>Draft Events</h3>
                     <div id="events-list" class="events-list"></div>
                 </div>
             </div>
 
-            <div id="draft-error" class="error-box hidden"></div>
+            <div id="draft-footer">
+                <button id="upload-btn" class="btn-primary hidden">Upload to aoe2cm.net</button>
+            </div>
 
-            <!-- Draft complete overlay -->
-            <div id="draft-complete" class="overlay hidden">
-                <div class="overlay-content">
-                    <div class="complete-icon">🏆</div>
-                    <h2>Draft Complete!</h2>
-                    <p>All turns have been reported.</p>
-                    <button id="new-draft-btn" class="btn-primary">New Draft</button>
+            <div id="draft-error" class="error-box hidden"></div>
+        </div>
+
+        <!-- UPLOAD SCREEN -->
+        <div id="upload-screen" class="screen">
+            <div class="upload-container">
+                <div class="logo-icon">📡</div>
+                <h2>Uploading Draft</h2>
+                <p id="upload-status">Connecting…</p>
+                <div class="progress-bar">
+                    <div id="upload-progress" class="progress-fill"></div>
+                </div>
+                <div id="upload-result" class="upload-result hidden">
+                    <p>Draft available at:</p>
+                    <a id="spec-url" href="#" target="_blank" class="spec-link"></a>
+                    <button id="new-draft-btn" class="btn-primary" style="margin-top:24px;">New Draft</button>
                 </div>
             </div>
         </div>

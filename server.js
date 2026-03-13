@@ -6,503 +6,242 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new SocketIOServer(server);
+const io = new SocketIOServer(server, {
+    cors: { origin: '*', methods: ['GET', 'POST'] },
+});
 
 const PORT = process.env.PORT || 3000;
 const AOE2CM_URL = process.env.AOE2CM_URL || 'https://aoe2cm.net';
 
-// --- Civilisation decoding (mirrors aoe2cm2 source) ---
-
-const ALL_CIVS = [
-    'Aztecs', 'Berbers', 'Britons', 'Burmese', 'Byzantines', 'Celts', 'Chinese',
-    'Ethiopians', 'Franks', 'Goths', 'Huns', 'Incas', 'Indians', 'Italians',
-    'Japanese', 'Khmer', 'Koreans', 'Magyars', 'Malay', 'Malians', 'Mayans',
-    'Mongols', 'Persians', 'Portuguese', 'Saracens', 'Slavs', 'Spanish',
-    'Teutons', 'Turks', 'Vietnamese', 'Vikings', 'Bulgarians', 'Cumans',
-    'Lithuanians', 'Tatars', 'Burgundians', 'Sicilians', 'Bohemians', 'Poles',
-    'Bengalis', 'Dravidians', 'Gurjaras', 'Hindustanis', 'Romans',
-    'Armenians', 'Georgians',
-    'Achaemenids', 'Athenians', 'Spartans',
-    'Shu', 'Wu', 'Wei', 'Jurchens', 'Khitans',
-    'Macedonians', 'Thracians', 'Puru',
-    'Mapuche', 'Muisca', 'Tupi',
-];
-
-function decodeEncodedCivilisations(encoded) {
-    if (!encoded) return [];
-    try {
-        const bits = [];
-        for (const ch of encoded.split('')) {
-            const num = parseInt(ch, 16);
-            if (isNaN(num)) return [];
-            const bin = num.toString(2).padStart(4, '0');
-            for (const b of bin) bits.push(b === '1');
-        }
-        const first = bits.indexOf(true);
-        const trimmed = bits.slice(first);
-
-        const civs = [];
-        for (let i = 0; i < trimmed.length; i++) {
-            if (trimmed[i]) {
-                const civIndex = trimmed.length - 1 - i;
-                if (civIndex < ALL_CIVS.length) {
-                    civs.push({
-                        id: ALL_CIVS[civIndex],
-                        name: ALL_CIVS[civIndex],
-                        imageUrls: {
-                            unit: `/images/civs/${ALL_CIVS[civIndex].toLowerCase()}.png`,
-                            emblem: `/images/civemblems/${ALL_CIVS[civIndex].toLowerCase()}.png`,
-                        },
-                        i18nPrefix: 'civs.',
-                        category: 'default',
-                    });
-                }
-            }
-        }
-        civs.sort((a, b) => a.name.localeCompare(b.name));
-        return civs;
-    } catch (e) {
-        console.error('Failed to decode civilisations:', e);
-        return [];
-    }
-}
-
-function resolveOptions(preset) {
-    if (preset.draftOptions && preset.draftOptions.length > 0) {
-        return preset.draftOptions;
-    }
-    if (preset.encodedCivilisations) {
-        return decodeEncodedCivilisations(preset.encodedCivilisations);
-    }
-    return [];
-}
-
-function actionToActionType(action) {
-    switch (action) {
-        case 'PICK': return 'pick';
-        case 'BAN': return 'ban';
-        case 'SNIPE': return 'snipe';
-        case 'STEAL': return 'steal';
-        default: return action.toLowerCase();
-    }
-}
-
-// --- Active draft sessions ---
-const sessions = new Map();
-
-// --- Serve static files ---
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Proxy civ/map images from aoe2cm.net
+// Proxy images from aoe2cm.net
 app.get('/images/*', async (req, res) => {
     try {
-        const imageUrl = `${AOE2CM_URL}${req.path}`;
-        const response = await fetch(imageUrl);
-        if (!response.ok) { res.status(404).send('Not found'); return; }
-        const contentType = response.headers.get('content-type');
-        if (contentType) res.set('Content-Type', contentType);
-        res.set('Cache-Control', 'public, max-age=86400');
-        const buffer = Buffer.from(await response.arrayBuffer());
-        res.send(buffer);
-    } catch (e) {
-        res.status(500).send('Image fetch failed');
-    }
+        const r = await fetch(`${AOE2CM_URL}${req.path}`);
+        if (!r.ok) { res.status(404).send('Not found'); return; }
+        const ct = r.headers.get('content-type');
+        if (ct) res.set('Content-Type', ct);
+        res.set('Cache-Control', 'public, max-age=604800');
+        res.send(Buffer.from(await r.arrayBuffer()));
+    } catch (e) { res.status(500).send('Image fetch failed'); }
 });
 
-// --- Socket.IO handling ---
+// --- Socket.IO ---
 
-io.on('connection', (frontendSocket) => {
-    console.log('Frontend client connected:', frontendSocket.id);
-    let currentSession = null;
+io.on('connection', (client) => {
+    console.log('Client connected:', client.id);
+    let liveSession = null; // for live mode cleanup
 
-    frontendSocket.on('create_draft', async (data) => {
+    // === SHARED: Fetch preset + create draft on aoe2cm.net ===
+    client.on('create_draft', async (data, ack) => {
         const { presetId, hostName, guestName } = data;
-        console.log(`Creating draft: preset=${presetId}, host=${hostName}, guest=${guestName}`);
-
+        console.log(`[create_draft] preset=${presetId}, host=${hostName}, guest=${guestName}`);
         try {
-            // 1. Fetch preset from aoe2cm.net
+            console.log(`[create_draft] Fetching preset from ${AOE2CM_URL}...`);
             const presetRes = await fetch(`${AOE2CM_URL}/api/preset/${encodeURIComponent(presetId)}`);
-            if (!presetRes.ok) {
-                frontendSocket.emit('error_msg', { message: `Failed to fetch preset: ${presetRes.status}` });
-                return;
-            }
+            console.log(`[create_draft] Preset response: ${presetRes.status}`);
+            if (!presetRes.ok) { ack({ error: `Preset not found (${presetRes.status})` }); return; }
             const preset = await presetRes.json();
-            const options = resolveOptions(preset);
+            console.log(`[create_draft] Preset "${preset.name}" loaded, ${preset.turns.length} turns`);
 
-            // 2. Create draft on aoe2cm.net
+            console.log(`[create_draft] Creating draft on aoe2cm.net...`);
             const createRes = await fetch(`${AOE2CM_URL}/api/draft/new`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    preset,
-                    participants: { host: hostName, guest: guestName },
-                }),
+                body: JSON.stringify({ preset, participants: { host: hostName, guest: guestName } }),
             });
             const createData = await createRes.json();
+            console.log(`[create_draft] Create response:`, createData.status);
             if (createData.status !== 'ok') {
-                frontendSocket.emit('error_msg', {
-                    message: `Draft creation failed: ${JSON.stringify(createData.validationErrors || createData.message)}`,
-                });
+                ack({ error: `Draft creation failed: ${JSON.stringify(createData.validationErrors || createData)}` });
                 return;
             }
 
             const draftId = createData.draftId;
-            console.log(`Draft created: ${draftId}`);
-
-            // 3. Set up session state
-            const session = {
-                draftId,
-                preset,
-                options,
-                turns: preset.turns,
-                hostName,
-                guestName,
-                nextAction: 0,
-                events: [],
-                hostSocket: null,
-                guestSocket: null,
-                hostRoleSet: false,
-                guestRoleSet: false,
-                hostReady: false,
-                guestReady: false,
-                bothPlayersReadySent: false,
-                finished: false,
-                pendingAct: null,       // tracks last act sent (resolves hidden events)
-            };
-            sessions.set(draftId, session);
-            currentSession = session;
-
-            // 4. Send initial info to frontend
-            frontendSocket.emit('draft_created', {
-                draftId,
-                spectatorUrl: `${AOE2CM_URL}/draft/${draftId}`,
-                options,
-                turns: preset.turns,
-                hostName,
-                guestName,
-            });
-
-            // 5. Connect two sockets to aoe2cm.net
-            await connectPlayerSockets(session, frontendSocket);
-
+            console.log(`[create_draft] Success! draftId=${draftId}`);
+            ack({ preset, draftId, spectatorUrl: `${AOE2CM_URL}/draft/${draftId}` });
         } catch (e) {
-            console.error('Error creating draft:', e);
-            frontendSocket.emit('error_msg', { message: `Error: ${e.message}` });
+            console.error(`[create_draft] Error:`, e);
+            ack({ error: `Network error: ${e.message}` });
         }
     });
 
-    frontendSocket.on('act', (data) => {
-        if (!currentSession || currentSession.finished) {
-            frontendSocket.emit('error_msg', { message: 'No active draft session' });
+    // === LIVE MODE: Connect sockets + forward acts in real-time ===
+    client.on('live_connect', async (data, ack) => {
+        const { draftId, hostName, guestName } = data;
+        console.log(`Live connect: ${draftId}`);
+
+        try {
+            const hostSocket = ioClient(AOE2CM_URL, { query: { draftId }, transports: ['websocket'], forceNew: true });
+            const guestSocket = ioClient(AOE2CM_URL, { query: { draftId }, transports: ['websocket'], forceNew: true });
+
+            liveSession = { draftId, hostSocket, guestSocket, finished: false };
+
+            await Promise.all([
+                waitForRole(hostSocket, hostName, 'HOST'),
+                waitForRole(guestSocket, guestName, 'GUEST'),
+            ]);
+            console.log('Live: both roles set');
+
+            // Listen for events from HOST socket (single source of truth)
+            hostSocket.on('playerEvent', (event) => {
+                console.log('Live playerEvent:', event.chosenOptionId);
+                client.emit('live_player_event', event);
+            });
+            hostSocket.on('adminEvent', (event) => {
+                console.log('Live adminEvent:', event.action);
+                client.emit('live_admin_event', event);
+            });
+            hostSocket.on('disconnect', (reason) => {
+                if (liveSession && !liveSession.finished) {
+                    liveSession.finished = true;
+                    client.emit('live_finished', {});
+                }
+            });
+
+            // Ready up
+            await Promise.all([
+                emitWithAck(hostSocket, 'ready', {}),
+                emitWithAck(guestSocket, 'ready', {}),
+            ]);
+            console.log('Live: both ready, draft started');
+            ack({ status: 'ok' });
+
+        } catch (e) {
+            console.error('Live connect error:', e);
+            ack({ error: e.message });
+        }
+    });
+
+    client.on('live_act', async (data, ack) => {
+        if (!liveSession) { ack({ error: 'No live session' }); return; }
+        const { executingPlayer, player, actionType, chosenOptionId } = data;
+        const socket = executingPlayer === 'HOST' ? liveSession.hostSocket : liveSession.guestSocket;
+
+        if (!socket || !socket.connected) {
+            ack({ error: `${executingPlayer} socket not connected` });
             return;
         }
 
-        const { chosenOptionId } = data;
-        const session = currentSession;
-        const turnIndex = session.nextAction;
+        const playerEvent = { player, executingPlayer, actionType, chosenOptionId, isRandomlyChosen: false, offset: 0 };
+        console.log(`Live act: ${executingPlayer} ${actionType} ${chosenOptionId}`);
 
-        if (turnIndex >= session.turns.length) {
-            frontendSocket.emit('error_msg', { message: 'Draft is already complete' });
-            return;
-        }
-
-        const turn = session.turns[turnIndex];
-
-        // Skip admin turns (REVEAL, PAUSE, etc.) - handled by server automatically
-        if (turn.executingPlayer === 'NONE') {
-            frontendSocket.emit('error_msg', { message: 'Waiting for admin action from server...' });
-            return;
-        }
-
-        const actionType = actionToActionType(turn.action);
-        const playerEvent = {
-            player: turn.player,
-            executingPlayer: turn.executingPlayer,
-            actionType,
-            chosenOptionId,
-            isRandomlyChosen: false,
-            offset: 0,
-        };
-
-        // Determine which socket to use
-        const targetSocket = (turn.executingPlayer === 'HOST')
-            ? session.hostSocket
-            : session.guestSocket;
-
-        if (!targetSocket || !targetSocket.connected) {
-            frontendSocket.emit('error_msg', { message: `${turn.executingPlayer} socket is not connected` });
-            return;
-        }
-
-        console.log(`Sending act via ${turn.executingPlayer}:`, playerEvent);
-
-        // Store pending act so we can resolve hidden events
-        session.pendingAct = {
-            chosenOptionId,
-            player: turn.player,
-            executingPlayer: turn.executingPlayer,
-            actionType,
-        };
-
-        targetSocket.emit('act', playerEvent, (response) => {
-            console.log('Act response:', response);
+        socket.emit('act', playerEvent, (response) => {
             if (response && response.status === 'error') {
-                session.pendingAct = null;
-                frontendSocket.emit('error_msg', {
-                    message: `Validation error: ${JSON.stringify(response.validationErrors)}`,
-                });
+                ack({ error: `Validation: ${JSON.stringify(response.validationErrors)}` });
+            } else {
+                ack({ status: 'ok' });
             }
         });
     });
 
-    frontendSocket.on('disconnect', () => {
-        console.log('Frontend client disconnected:', frontendSocket.id);
-        if (currentSession) {
-            cleanupSession(currentSession);
+    // === POST-DRAFT MODE: Replay completed events ===
+    client.on('upload_draft', async (data, ack) => {
+        const { draftId, preset, hostName, guestName, events } = data;
+        console.log(`Upload: ${events.length} events to ${draftId}`);
+        try {
+            await replayDraft(draftId, hostName, guestName, preset.turns, events, client);
+            ack({ status: 'ok' });
+        } catch (e) {
+            console.error('Upload error:', e);
+            ack({ error: e.message });
+        }
+    });
+
+    // === CLEANUP ===
+    client.on('disconnect', () => {
+        console.log('Client disconnected:', client.id);
+        if (liveSession) {
+            liveSession.hostSocket?.disconnect();
+            liveSession.guestSocket?.disconnect();
+            liveSession = null;
         }
     });
 });
 
-async function connectPlayerSockets(session, frontendSocket) {
-    const { draftId, hostName, guestName } = session;
+// --- Post-draft replay ---
 
-    return new Promise((resolve, reject) => {
-        let hostConnected = false;
-        let guestConnected = false;
+async function replayDraft(draftId, hostName, guestName, turns, playerEvents, client) {
+    const hostSocket = ioClient(AOE2CM_URL, { query: { draftId }, transports: ['websocket'], forceNew: true });
+    const guestSocket = ioClient(AOE2CM_URL, { query: { draftId }, transports: ['websocket'], forceNew: true });
+    const ADMIN_DELAY = 2500;
+    const cleanup = () => { hostSocket.disconnect(); guestSocket.disconnect(); };
 
-        function checkBothConnected() {
-            if (hostConnected && guestConnected) {
-                resolve();
-            }
+    try {
+        await Promise.all([
+            waitForRole(hostSocket, hostName, 'HOST'),
+            waitForRole(guestSocket, guestName, 'GUEST'),
+        ]);
+        client.emit('upload_progress', { phase: 'connected', current: 0, total: playerEvents.length });
+
+        await Promise.all([
+            emitWithAck(hostSocket, 'ready', {}),
+            emitWithAck(guestSocket, 'ready', {}),
+        ]);
+
+        // Skip leading admin turns
+        let turnIdx = 0;
+        let leadingAdmins = 0;
+        while (turnIdx < turns.length && isAdminTurn(turns[turnIdx])) { leadingAdmins++; turnIdx++; }
+        if (leadingAdmins > 0) await delay(leadingAdmins * ADMIN_DELAY);
+
+        client.emit('upload_progress', { phase: 'replaying', current: 0, total: playerEvents.length });
+
+        let evtIdx = 0;
+        while (evtIdx < playerEvents.length && turnIdx < turns.length) {
+            const evt = playerEvents[evtIdx];
+            const socket = evt.executingPlayer === 'HOST' ? hostSocket : guestSocket;
+            const result = await emitWithAck(socket, 'act', {
+                player: evt.player, executingPlayer: evt.executingPlayer,
+                actionType: evt.actionType, chosenOptionId: evt.chosenOptionId,
+                isRandomlyChosen: false, offset: 0,
+            });
+            if (result?.status === 'error') throw new Error(`Event ${evtIdx+1}: ${JSON.stringify(result.validationErrors)}`);
+
+            evtIdx++; turnIdx++;
+            client.emit('upload_progress', { phase: 'replaying', current: evtIdx, total: playerEvents.length });
+
+            let adminCount = 0;
+            while (turnIdx < turns.length && isAdminTurn(turns[turnIdx])) { adminCount++; turnIdx++; }
+            await delay(adminCount > 0 ? adminCount * ADMIN_DELAY : 200);
         }
 
-        // --- HOST SOCKET ---
-        const hostSocket = ioClient(AOE2CM_URL, {
-            query: { draftId },
-            transports: ['websocket'],
-            forceNew: true,
+        await delay(2000);
+        client.emit('upload_complete', { draftId });
+    } catch (e) {
+        client.emit('upload_error', { message: e.message });
+    } finally { cleanup(); }
+}
+
+// --- Helpers ---
+
+function isAdminTurn(t) {
+    return t.executingPlayer === 'NONE' ||
+        ['REVEAL_ALL','REVEAL_PICKS','REVEAL_BANS','REVEAL_SNIPES','PAUSE','RESET_CL'].includes(t.action);
+}
+
+function waitForRole(socket, name, role) {
+    return new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error(`${role} timeout`)), 15000);
+        socket.on('connect', () => {
+            socket.emit('set_role', { name, role }, () => { clearTimeout(t); resolve(); });
         });
-        session.hostSocket = hostSocket;
-
-        hostSocket.on('connect', () => {
-            console.log(`HOST socket connected for draft ${draftId}`);
-
-            hostSocket.emit('set_role', { name: hostName, role: 'HOST' }, (draftConfig) => {
-                console.log('HOST role set');
-                session.hostRoleSet = true;
-                hostConnected = true;
-                checkBothConnected();
-                tryReadyUp(session, frontendSocket);
-            });
-        });
-
-        hostSocket.on('draft_state', (state) => {
-            console.log('HOST received draft_state');
-        });
-
-        hostSocket.on('playerEvent', (event) => {
-            console.log('HOST received playerEvent:', event);
-            handlePlayerEvent(session, event, 'HOST', frontendSocket);
-        });
-
-        hostSocket.on('adminEvent', (event) => {
-            console.log('HOST received adminEvent:', event);
-            handleAdminEvent(session, event, frontendSocket);
-        });
-
-        hostSocket.on('player_set_role', (msg) => {
-            console.log('HOST saw player_set_role:', msg);
-        });
-
-        hostSocket.on('player_ready', (msg) => {
-            console.log('HOST saw player_ready:', msg);
-        });
-
-        hostSocket.on('disconnect', (reason) => {
-            console.log(`HOST socket disconnected: ${reason}`);
-            if (session.finished) {
-                frontendSocket.emit('draft_finished', {});
-            } else {
-                frontendSocket.emit('error_msg', { message: `HOST disconnected: ${reason}` });
-            }
-        });
-
-        hostSocket.on('connect_error', (err) => {
-            console.error('HOST connection error:', err.message);
-            frontendSocket.emit('error_msg', { message: `HOST connection error: ${err.message}` });
-        });
-
-        hostSocket.on('message', (msg) => {
-            console.log('HOST received message:', msg);
-        });
-
-        // --- GUEST SOCKET ---
-        const guestSocket = ioClient(AOE2CM_URL, {
-            query: { draftId },
-            transports: ['websocket'],
-            forceNew: true,
-        });
-        session.guestSocket = guestSocket;
-
-        guestSocket.on('connect', () => {
-            console.log(`GUEST socket connected for draft ${draftId}`);
-
-            guestSocket.emit('set_role', { name: guestName, role: 'GUEST' }, (draftConfig) => {
-                console.log('GUEST role set');
-                session.guestRoleSet = true;
-                guestConnected = true;
-                checkBothConnected();
-                tryReadyUp(session, frontendSocket);
-            });
-        });
-
-        guestSocket.on('draft_state', (state) => {
-            console.log('GUEST received draft_state');
-        });
-
-        guestSocket.on('playerEvent', () => {
-            // Tracked via HOST socket only
-        });
-
-        guestSocket.on('adminEvent', () => {
-            // Tracked via HOST socket only
-        });
-
-        guestSocket.on('player_set_role', (msg) => {
-            console.log('GUEST saw player_set_role:', msg);
-        });
-
-        guestSocket.on('player_ready', (msg) => {
-            console.log('GUEST saw player_ready:', msg);
-        });
-
-        guestSocket.on('disconnect', (reason) => {
-            console.log(`GUEST socket disconnected: ${reason}`);
-            if (session.finished) {
-                frontendSocket.emit('draft_finished', {});
-            } else {
-                frontendSocket.emit('error_msg', { message: `GUEST disconnected: ${reason}` });
-            }
-        });
-
-        guestSocket.on('connect_error', (err) => {
-            console.error('GUEST connection error:', err.message);
-            frontendSocket.emit('error_msg', { message: `GUEST connection error: ${err.message}` });
-        });
-
-        guestSocket.on('message', (msg) => {
-            console.log('GUEST received message:', msg);
-        });
-
-        // Timeout
-        setTimeout(() => {
-            if (!hostConnected || !guestConnected) {
-                reject(new Error('Connection timeout'));
-            }
-        }, 15000);
+        socket.on('connect_error', (e) => { clearTimeout(t); reject(e); });
     });
 }
 
-function tryReadyUp(session, frontendSocket) {
-    if (session.bothPlayersReadySent) return;
-    if (!session.hostRoleSet || !session.guestRoleSet) return;
-    if (!session.hostSocket?.connected || !session.guestSocket?.connected) return;
-
-    session.bothPlayersReadySent = true;
-    console.log('Both roles set, readying up...');
-
-    session.hostSocket.emit('ready', {}, (draftConfig) => {
-        console.log('HOST ready ack');
-        session.hostReady = true;
-        checkDraftStarted(session, frontendSocket);
-    });
-
-    session.guestSocket.emit('ready', {}, (draftConfig) => {
-        console.log('GUEST ready ack');
-        session.guestReady = true;
-        checkDraftStarted(session, frontendSocket);
+function emitWithAck(socket, event, data) {
+    return new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error(`${event} ack timeout`)), 10000);
+        socket.emit(event, data, (r) => { clearTimeout(t); resolve(r); });
     });
 }
 
-function checkDraftStarted(session, frontendSocket) {
-    if (session.hostReady && session.guestReady) {
-        console.log('Both players ready - draft started!');
-        frontendSocket.emit('draft_started', {
-            nextAction: session.nextAction,
-            turn: session.turns[session.nextAction] || null,
-        });
-    }
-}
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function handlePlayerEvent(session, event, source, frontendSocket) {
-    // Resolve hidden events using our known pending act
-    const HIDDEN_IDS = ['HIDDEN_PICK', 'HIDDEN_BAN', 'HIDDEN_SNIPE', 'HIDDEN_STEAL', 'HIDDEN'];
-    let resolvedOptionId = event.chosenOptionId;
-
-    if (HIDDEN_IDS.includes(event.chosenOptionId) && session.pendingAct) {
-        resolvedOptionId = session.pendingAct.chosenOptionId;
-        console.log(`Resolved hidden ${event.chosenOptionId} → ${resolvedOptionId}`);
-    }
-    session.pendingAct = null;
-
-    const resolvedEvent = {
-        ...event,
-        chosenOptionId: resolvedOptionId,
-    };
-
-    // Track the event
-    session.events.push(resolvedEvent);
-    session.nextAction++;
-
-    // Send to frontend
-    frontendSocket.emit('player_event', {
-        ...resolvedEvent,
-        turnIndex: session.nextAction - 1,
-        nextAction: session.nextAction,
-        nextTurn: session.turns[session.nextAction] || null,
-    });
-
-    // Check if draft is complete
-    if (session.nextAction >= session.turns.length) {
-        session.finished = true;
-        console.log('Draft complete!');
-    }
-}
-
-function handleAdminEvent(session, event, frontendSocket) {
-    session.events.push(event);
-    session.nextAction++;
-
-    frontendSocket.emit('admin_event', {
-        ...event,
-        turnIndex: session.nextAction - 1,
-        nextAction: session.nextAction,
-        nextTurn: session.turns[session.nextAction] || null,
-    });
-
-    if (session.nextAction >= session.turns.length) {
-        session.finished = true;
-        console.log('Draft complete (after admin event)!');
-    }
-}
-
-function cleanupSession(session) {
-    if (session.hostSocket) {
-        session.hostSocket.disconnect();
-        session.hostSocket = null;
-    }
-    if (session.guestSocket) {
-        session.guestSocket.disconnect();
-        session.guestSocket = null;
-    }
-    sessions.delete(session.draftId);
-    console.log(`Session ${session.draftId} cleaned up`);
-}
-
-// --- Start server ---
-server.listen(PORT, () => {
-    console.log(`\n  AoE2 CM Reporter running at:`);
-    console.log(`  → Local:   http://localhost:${PORT}`);
-    console.log(`  → Network: http://<your-ip>:${PORT}\n`);
-    console.log(`  Proxying to: ${AOE2CM_URL}\n`);
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n  AoE2 CM Reporter`);
+    console.log(`  → http://localhost:${PORT}`);
+    console.log(`  → Proxying to: ${AOE2CM_URL}\n`);
 });
